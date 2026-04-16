@@ -1,2 +1,0 @@
-# thuyktutt
-Auto setupthuykyutt
