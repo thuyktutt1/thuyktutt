@@ -17,28 +17,42 @@ read -p "Chon option: " choice
 
 # ================= OPTION 1 =================
 install_aro() {
-    echo ">>> Dang cai ARO..."
+    echo ">>> Dang cai ARO theo tung buoc..."
 
-    apt update && apt upgrade -y
+    # B1: Update he thong
+    sudo apt update && sudo apt upgrade -y
 
-    apt install xfce4 xfce4-goodies -y
-    apt install dbus-x11 x11-xserver-utils -y
-    apt install xrdp -y
+    # B2: Cai XFCE
+    sudo apt install xfce4 xfce4-goodies -y
 
+    # B3: Cai thu vien can thiet
+    sudo apt install dbus-x11 x11-xserver-utils -y
+
+    # B4: Cai XRDP
+    sudo apt install xrdp -y
+
+    # B5: Set XFCE lam mac dinh
     echo "startxfce4" > ~/.xsession
     chmod 644 ~/.xsession
 
-    systemctl enable xrdp
-    systemctl start xrdp
+    # B6: Bat XRDP
+    sudo systemctl enable xrdp
+    sudo systemctl start xrdp
 
-    wget -O aro.deb https://download.aro.network/files/packages/linux/ARO_Desktop_latest_debian.deb || {
+    # B7: Tai ARO Desktop
+    wget https://download.aro.network/files/packages/linux/ARO_Desktop_latest_debian.deb || {
         echo "Download ARO that bai!"
         return
     }
 
-    apt install ./aro.deb -y
+    # B8: Cai ARO
+    sudo apt install ./ARO_Desktop_latest_debian.deb -y || {
+        echo "Cai dat ARO that bai!"
+        return
+    }
 
-    systemctl restart xrdp
+    # Restart XRDP
+    sudo systemctl restart xrdp
 
     echo ">>> DONE!"
 }
@@ -65,12 +79,12 @@ swap_ram() {
         return
     fi
 
-    fallocate -l ${size}G /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
+    sudo fallocate -l ${size}G /swapfile
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
 
-    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
 
     free -h
 }
@@ -79,13 +93,13 @@ swap_ram() {
 auto_xrdp() {
     echo ">>> Dang setup XRDP auto..."
 
-    systemctl enable xrdp
-    systemctl enable dbus
+    sudo systemctl enable xrdp
+    sudo systemctl enable dbus
 
     echo "startxfce4" > /root/.xsession
-    chmod 644 /root/.xsession
+    sudo chmod 644 /root/.xsession
 
-    systemctl restart xrdp
+    sudo systemctl restart xrdp
 
     echo ">>> XRDP auto OK"
 }
@@ -101,16 +115,16 @@ create_user() {
         return
     fi
 
-    useradd -m -s /bin/bash "$user"
-    echo "$user:$pass" | chpasswd
+    sudo useradd -m -s /bin/bash "$user"
+    echo "$user:$pass" | sudo chpasswd
 
-    usermod -aG sudo "$user"
+    sudo usermod -aG sudo "$user"
 
-    echo "startxfce4" > /home/$user/.xsession
-    chmod 644 /home/$user/.xsession
-    chown $user:$user /home/$user/.xsession
+    echo "startxfce4" | sudo tee /home/$user/.xsession >/dev/null
+    sudo chmod 644 /home/$user/.xsession
+    sudo chown $user:$user /home/$user/.xsession
 
-    echo "User: $user | Pass: $pass" >> /root/user_info.txt
+    echo "User: $user | Pass: $pass" | sudo tee -a /root/user_info.txt >/dev/null
 
     echo ">>> Tao user thanh cong!"
     echo ">>> Thong tin da luu tai /root/user_info.txt"
@@ -120,11 +134,11 @@ create_user() {
 fix_xrdp() {
     echo ">>> Dang fix XRDP..."
 
-    echo "startxfce4" > /root/.xsession
-    chmod 644 /root/.xsession
+    echo "startxfce4" > ~/.xsession
+    chmod 644 ~/.xsession
 
-    systemctl restart dbus
-    systemctl restart xrdp
+    sudo systemctl restart dbus
+    sudo systemctl restart xrdp
 
     mkdir -p ~/.config/xfce4/xfconf/xfce-perchannel-xml
 
