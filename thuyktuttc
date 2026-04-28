@@ -2,14 +2,26 @@
 set -euo pipefail
 
 # ============================================================
-# ARO Multi-User Proxy Setup
-# redsocks + iptables + hostname + optional cron restart
+# ARO Proxy Manager
+# redsocks + iptables + hostname + cron per user
 #
-# Muc tieu:
-# - Gan proxy rieng cho tung Linux user: aro, aro1, aro2...
-# - Luu HOSTNAME trong config redsocks, KHONG luu IP cung
-# - Khi proxy/hostname doi IP: chi can restart redsocks-user
-# - Co menu cai/xoa/xem cron auto restart redsocks moi ngay
+# Proxy format:
+#   host:port:user:pass
+# Example:
+#   snf5.tunproxy.com:65447:Dz8qWu:Cht0PT4D
+#
+# Menu:
+# 1) Setup / doi proxy cho 1 user
+# 2) Cai / cap nhat auto restart redsocks cho 1 user
+# 3) Xoa auto restart redsocks cho 1 user
+# 4) Xem cron auto restart hien tai
+# 5) Test IP root va IP user
+# 0) Thoat
+#
+# Luu y:
+# - Config redsocks luu HOSTNAME, khong luu IP cung.
+# - Auto restart theo tung user, khong restart tat ca cung luc.
+# - Script chi restart redsocks-user, khong reboot VPS.
 # ============================================================
 
 BASE_PORT=12345
@@ -21,6 +33,11 @@ require_root() {
     echo "Vui long chay bang root hoac sudo."
     exit 1
   fi
+}
+
+pause() {
+  echo
+  read -rp "Nhan Enter de tiep tuc..." _
 }
 
 list_normal_users() {
@@ -54,6 +71,28 @@ sanitize_user_tag() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
 }
 
+ask_user() {
+  echo "User hien co trong may:"
+  list_normal_users | sed 's/^/ - /'
+  echo
+  read -rp "Nhap user, vi du aro2: " TARGET_USER
+  TARGET_USER="${TARGET_USER:-}"
+
+  if [[ -z "$TARGET_USER" ]]; then
+    echo "Ban chua nhap user."
+    return 1
+  fi
+
+  if ! user_exists "$TARGET_USER"; then
+    echo "Khong tim thay user '$TARGET_USER'."
+    echo "Hay tao user truoc bang aro-tool.sh."
+    return 1
+  fi
+
+  USER_TAG="$(sanitize_user_tag "$TARGET_USER")"
+  return 0
+}
+
 resolve_ipv4() {
   local host="$1"
   if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -74,7 +113,7 @@ next_free_port() {
 ensure_dependencies() {
   export DEBIAN_FRONTEND=noninteractive
   apt update
-  apt install -y redsocks iptables-persistent curl iproute2
+  apt install -y redsocks iptables-persistent curl iproute2 cron
 }
 
 create_dirs() {
@@ -97,116 +136,124 @@ save_iptables() {
 }
 
 show_header() {
+  clear || true
   echo "=============================================="
-  echo " ARO Multi-User Proxy Setup"
-  echo " redsocks + iptables + hostname + cron"
+  echo " ARO Proxy Manager"
+  echo " redsocks + hostname + cron/user"
+  echo " Proxy: host:port:user:pass"
   echo "=============================================="
   echo
 }
 
-manage_restart_cron() {
+cron_marker_for_user() {
+  local user_tag="$1"
+  echo "ARO_AUTO_RESTART_REDSOCKS_${user_tag}"
+}
+
+install_cron_for_user() {
   local user_tag="$1"
   local service_name="redsocks-${user_tag}.service"
-  local marker="ARO_AUTO_RESTART_REDSOCKS_${user_tag}"
+  local marker
+  marker="$(cron_marker_for_user "$user_tag")"
 
   echo
-  echo "===== Auto restart redsocks cho ${service_name} ====="
-  echo "1) Cai / cap nhat auto restart moi ngay"
-  echo "2) Xoa auto restart"
-  echo "3) Xem cron auto restart hien tai"
-  echo "0) Bo qua"
-  read -rp "Chon: " CRON_CHOICE
+  echo "Cai / cap nhat auto restart cho ${service_name}"
+  echo "Nhap gio theo format 24h. Vi du:"
+  echo "  Gio 3, phut 10  = 03:10 theo gio VPS"
+  echo "  Gio 22, phut 40 = 22:40 theo gio VPS"
+  echo
+  read -rp "Nhap gio restart moi ngay (0-23): " RS_HOUR
+  read -rp "Nhap phut restart moi ngay (0-59): " RS_MIN
 
-  case "${CRON_CHOICE:-0}" in
-    1)
-      read -rp "Nhap gio restart moi ngay (0-23): " RS_HOUR
-      read -rp "Nhap phut restart moi ngay (0-59): " RS_MIN
+  if ! validate_hour "$RS_HOUR"; then
+    echo "Gio khong hop le."
+    return 1
+  fi
 
-      if ! validate_hour "$RS_HOUR"; then
-        echo "Gio khong hop le. Bo qua cai cron."
-        return 0
-      fi
+  if ! validate_minute "$RS_MIN"; then
+    echo "Phut khong hop le."
+    return 1
+  fi
 
-      if ! validate_minute "$RS_MIN"; then
-        echo "Phut khong hop le. Bo qua cai cron."
-        return 0
-      fi
+  local cron_line
+  cron_line="${RS_MIN} ${RS_HOUR} * * * /bin/systemctl restart ${service_name} # ${marker}"
 
-      local cron_line
-      cron_line="${RS_MIN} ${RS_HOUR} * * * /bin/systemctl restart ${service_name} # ${marker}"
+  (
+    crontab -l 2>/dev/null | grep -v "${marker}" || true
+    echo "${cron_line}"
+  ) | crontab -
 
-      (
-        crontab -l 2>/dev/null | grep -v "${marker}" || true
-        echo "${cron_line}"
-      ) | crontab -
-
-      echo "Da cai auto restart ${service_name} moi ngay luc ${RS_HOUR}:${RS_MIN}"
-      ;;
-
-    2)
-      (
-        crontab -l 2>/dev/null | grep -v "${marker}" || true
-      ) | crontab -
-      echo "Da xoa auto restart cho ${service_name}"
-      ;;
-
-    3)
-      echo "Cron auto restart hien tai:"
-      crontab -l 2>/dev/null | grep "ARO_AUTO_RESTART_REDSOCKS" || echo "Chua co cron auto restart redsocks."
-      ;;
-
-    *)
-      echo "Bo qua auto restart."
-      ;;
-  esac
+  echo
+  echo "Da cai auto restart ${service_name} moi ngay luc ${RS_HOUR}:${RS_MIN}"
+  echo "Chi restart rieng ${service_name}, khong restart cac user khac."
 }
 
-main() {
-  require_root
-  show_header
+remove_cron_for_user() {
+  local user_tag="$1"
+  local service_name="redsocks-${user_tag}.service"
+  local marker
+  marker="$(cron_marker_for_user "$user_tag")"
 
-  echo "User hien co trong may:"
-  list_normal_users | sed 's/^/ - /'
+  (
+    crontab -l 2>/dev/null | grep -v "${marker}" || true
+  ) | crontab -
+
+  echo "Da xoa auto restart cho ${service_name}"
+}
+
+show_cron() {
   echo
+  echo "Cron auto restart hien tai:"
+  crontab -l 2>/dev/null | grep "ARO_AUTO_RESTART_REDSOCKS" || echo "Chua co cron auto restart redsocks."
+}
 
-  read -rp "Nhap user can gan proxy, vi du aro2: " TARGET_USER
-  TARGET_USER="${TARGET_USER:-}"
+parse_proxy_line() {
+  local line="$1"
 
-  if [[ -z "$TARGET_USER" ]]; then
-    echo "Ban chua nhap user."
-    exit 1
+  IFS=':' read -r PROXY_HOST PROXY_PORT PROXY_USER PROXY_PASS EXTRA <<< "$line"
+
+  if [[ -n "${EXTRA:-}" ]]; then
+    echo "Proxy sai dinh dang. Pass khong duoc co dau ':'"
+    return 1
   fi
 
-  if ! user_exists "$TARGET_USER"; then
-    echo "Khong tim thay user '$TARGET_USER'."
-    echo "Hay tao user truoc bang aro-tool.sh."
-    exit 1
-  fi
-
-  echo
-  echo "Nhap proxy dang HOSTNAME, khong nen nhap IP cung."
-  echo "Vi du: snvn5.tunproxy.com"
-  read -rp "Proxy host hostname/domain: " PROXY_HOST
-  read -rp "Proxy port: " PROXY_PORT
-  read -rp "Proxy user: " PROXY_USER
-  read -rsp "Proxy pass: " PROXY_PASS
-  echo
-
-  if [[ -z "$PROXY_HOST" || -z "$PROXY_PORT" || -z "$PROXY_USER" || -z "$PROXY_PASS" ]]; then
-    echo "Thieu thong tin proxy."
-    exit 1
+  if [[ -z "${PROXY_HOST:-}" || -z "${PROXY_PORT:-}" || -z "${PROXY_USER:-}" || -z "${PROXY_PASS:-}" ]]; then
+    echo "Proxy sai dinh dang."
+    echo "Dung format: host:port:user:pass"
+    return 1
   fi
 
   if ! validate_port "$PROXY_PORT"; then
     echo "Proxy port khong hop le."
-    exit 1
+    return 1
+  fi
+
+  return 0
+}
+
+setup_proxy_for_user() {
+  if ! ask_user; then
+    return 1
+  fi
+
+  echo
+  echo "Nhap proxy theo dung dinh dang:"
+  echo "host:port:user:pass"
+  echo
+  echo "Vi du:"
+  echo "snf5.tunproxy.com:65447:Dz8qWu:Cht0PT4D"
+  echo
+  read -rp "Nhap proxy: " PROXY_LINE
+
+  if ! parse_proxy_line "$PROXY_LINE"; then
+    return 1
   fi
 
   PROXY_IP="$(resolve_ipv4 "$PROXY_HOST" || true)"
   if [[ -z "${PROXY_IP:-}" ]]; then
     echo "Khong resolve duoc IPv4 cho proxy host: $PROXY_HOST"
     echo "Hay kiem tra hostname/proxy provider."
-    exit 1
+    return 1
   fi
 
   USER_UID="$(get_uid "$TARGET_USER")"
@@ -302,7 +349,12 @@ EOF
   echo ">>> Dang luu iptables..."
   save_iptables
 
-  manage_restart_cron "$USER_TAG"
+  echo
+  read -rp "Co cai/cap nhat auto restart redsocks cho rieng user ${TARGET_USER} khong? (y/N): " WANT_CRON
+  WANT_CRON="${WANT_CRON:-N}"
+  if [[ "$WANT_CRON" =~ ^[Yy]$ ]]; then
+    install_cron_for_user "$USER_TAG" || true
+  fi
 
   echo
   echo ">>> Kiem tra nhanh service..."
@@ -338,4 +390,83 @@ EOF
   echo "=============================================="
 }
 
-main "$@"
+menu_install_cron() {
+  if ! ask_user; then
+    return 1
+  fi
+  install_cron_for_user "$USER_TAG"
+}
+
+menu_remove_cron() {
+  if ! ask_user; then
+    return 1
+  fi
+  remove_cron_for_user "$USER_TAG"
+}
+
+test_ip_user() {
+  if ! ask_user; then
+    return 1
+  fi
+
+  echo
+  echo "ROOT IP / IP VPS goc:"
+  curl -4 --max-time 15 -s https://api.ipify.org ; echo
+
+  echo
+  echo "${TARGET_USER} IP / IP proxy cua user:"
+  su - "$TARGET_USER" -c 'curl -4 --max-time 20 -s https://api.ipify.org ; echo' || true
+
+  echo
+  echo "Service redsocks-${USER_TAG}:"
+  systemctl status "redsocks-${USER_TAG}.service" --no-pager || true
+}
+
+main_menu() {
+  require_root
+
+  while true; do
+    show_header
+    echo "1) Setup / doi proxy cho 1 user"
+    echo "2) Cai / cap nhat auto restart redsocks cho 1 user"
+    echo "3) Xoa auto restart redsocks cho 1 user"
+    echo "4) Xem cron auto restart hien tai"
+    echo "5) Test IP root va IP user"
+    echo "0) Thoat"
+    echo
+    read -rp "Chon: " CHOICE
+
+    case "${CHOICE:-}" in
+      1)
+        setup_proxy_for_user || true
+        pause
+        ;;
+      2)
+        menu_install_cron || true
+        pause
+        ;;
+      3)
+        menu_remove_cron || true
+        pause
+        ;;
+      4)
+        show_cron
+        pause
+        ;;
+      5)
+        test_ip_user || true
+        pause
+        ;;
+      0)
+        echo "Thoat."
+        exit 0
+        ;;
+      *)
+        echo "Lua chon khong hop le."
+        pause
+        ;;
+    esac
+  done
+}
+
+main_menu "$@"
