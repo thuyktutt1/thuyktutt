@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ARO multi-user proxy setup
-# - Requires an existing Linux user
-# - Creates dedicated redsocks config/service/iptables chain per user
-# - Persists after reboot
-# - Stores proxy HOSTNAME in redsocks config, not resolved IP
-# - Optional daily auto restart redsocks service
-# - Optional remove/view cron auto restart
+# ============================================================
+# ARO Multi-User Proxy Setup
+# redsocks + iptables + hostname + optional cron restart
+#
+# Muc tieu:
+# - Gan proxy rieng cho tung Linux user: aro, aro1, aro2...
+# - Luu HOSTNAME trong config redsocks, KHONG luu IP cung
+# - Khi proxy/hostname doi IP: chi can restart redsocks-user
+# - Co menu cai/xoa/xem cron auto restart redsocks moi ngay
+# ============================================================
 
 BASE_PORT=12345
 REDSOCKS_DIR="/etc/aro-proxy"
@@ -21,21 +24,21 @@ require_root() {
 }
 
 list_normal_users() {
-  awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd
+  awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd || true
 }
 
 validate_port() {
-  local p="$1"
+  local p="${1:-}"
   [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
 }
 
 validate_hour() {
-  local h="$1"
+  local h="${1:-}"
   [[ "$h" =~ ^[0-9]+$ ]] && (( h >= 0 && h <= 23 ))
 }
 
 validate_minute() {
-  local m="$1"
+  local m="${1:-}"
   [[ "$m" =~ ^[0-9]+$ ]] && (( m >= 0 && m <= 59 ))
 }
 
@@ -45,6 +48,10 @@ user_exists() {
 
 get_uid() {
   id -u "$1"
+}
+
+sanitize_user_tag() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
 }
 
 resolve_ipv4() {
@@ -57,11 +64,21 @@ resolve_ipv4() {
 }
 
 next_free_port() {
-  local p=$BASE_PORT
-  while ss -ltn | grep -q ":${p} "; do
+  local p="$BASE_PORT"
+  while ss -ltn 2>/dev/null | grep -q ":${p} "; do
     ((p++))
   done
   echo "$p"
+}
+
+ensure_dependencies() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt update
+  apt install -y redsocks iptables-persistent curl iproute2
+}
+
+create_dirs() {
+  mkdir -p "$REDSOCKS_DIR"
 }
 
 disable_ipv6_persistently() {
@@ -71,26 +88,12 @@ disable_ipv6_persistently() {
   grep -q '^net.ipv6.conf.default.disable_ipv6 = 1$' "$sysctl_file" || echo 'net.ipv6.conf.default.disable_ipv6 = 1' >> "$sysctl_file"
   grep -q '^net.ipv6.conf.lo.disable_ipv6 = 1$' "$sysctl_file" || echo 'net.ipv6.conf.lo.disable_ipv6 = 1' >> "$sysctl_file"
 
-  sysctl -p >/dev/null
+  sysctl -p >/dev/null || true
 }
 
 save_iptables() {
   mkdir -p /etc/iptables
   iptables-save > /etc/iptables/rules.v4
-}
-
-ensure_dependencies() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt update
-  apt install -y redsocks iptables-persistent curl
-}
-
-create_dirs() {
-  mkdir -p "$REDSOCKS_DIR"
-}
-
-sanitize_user_tag() {
-  echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
 }
 
 show_header() {
@@ -129,11 +132,12 @@ manage_restart_cron() {
         return 0
       fi
 
-      CRON_LINE="${RS_MIN} ${RS_HOUR} * * * /bin/systemctl restart ${service_name} # ${marker}"
+      local cron_line
+      cron_line="${RS_MIN} ${RS_HOUR} * * * /bin/systemctl restart ${service_name} # ${marker}"
 
       (
         crontab -l 2>/dev/null | grep -v "${marker}" || true
-        echo "${CRON_LINE}"
+        echo "${cron_line}"
       ) | crontab -
 
       echo "Da cai auto restart ${service_name} moi ngay luc ${RS_HOUR}:${RS_MIN}"
@@ -165,7 +169,7 @@ main() {
   list_normal_users | sed 's/^/ - /'
   echo
 
-  read -rp "Nhap user can gan proxy: " TARGET_USER
+  read -rp "Nhap user can gan proxy, vi du aro2: " TARGET_USER
   TARGET_USER="${TARGET_USER:-}"
 
   if [[ -z "$TARGET_USER" ]]; then
@@ -179,7 +183,10 @@ main() {
     exit 1
   fi
 
-  read -rp "Proxy host hostname/domain, khong nen nhap IP cung: " PROXY_HOST
+  echo
+  echo "Nhap proxy dang HOSTNAME, khong nen nhap IP cung."
+  echo "Vi du: snvn5.tunproxy.com"
+  read -rp "Proxy host hostname/domain: " PROXY_HOST
   read -rp "Proxy port: " PROXY_PORT
   read -rp "Proxy user: " PROXY_USER
   read -rsp "Proxy pass: " PROXY_PASS
@@ -195,9 +202,10 @@ main() {
     exit 1
   fi
 
-  PROXY_IP="$(resolve_ipv4 "$PROXY_HOST")"
+  PROXY_IP="$(resolve_ipv4 "$PROXY_HOST" || true)"
   if [[ -z "${PROXY_IP:-}" ]]; then
     echo "Khong resolve duoc IPv4 cho proxy host: $PROXY_HOST"
+    echo "Hay kiem tra hostname/proxy provider."
     exit 1
   fi
 
@@ -280,8 +288,8 @@ EOF
 
   echo ">>> Dang reload systemd va khoi dong service..."
   systemctl daemon-reload
-  systemctl enable "redsocks-${USER_TAG}"
-  systemctl restart "redsocks-${USER_TAG}"
+  systemctl enable "redsocks-${USER_TAG}.service"
+  systemctl restart "redsocks-${USER_TAG}.service"
 
   read -rp "Co tat IPv6 persistent cho may nay khong? (y/N): " DISABLE_IPV6
   DISABLE_IPV6="${DISABLE_IPV6:-N}"
@@ -297,18 +305,13 @@ EOF
   manage_restart_cron "$USER_TAG"
 
   echo
-  echo ">>> Kiem tra nhanh..."
-  systemctl is-active "redsocks-${USER_TAG}" || true
+  echo ">>> Kiem tra nhanh service..."
+  systemctl is-active "redsocks-${USER_TAG}.service" || true
   ss -tulpn | grep "$LOCAL_PORT" || true
 
   echo
   echo ">>> Test IP cua user ${TARGET_USER}:"
   su - "$TARGET_USER" -c 'curl -4 --max-time 20 -s https://api.ipify.org ; echo' || true
-
-  if [[ "$DISABLE_IPV6" =~ ^[Yy]$ ]]; then
-    echo ">>> Test IPv6, mong muon rong:"
-    su - "$TARGET_USER" -c 'curl -6 --max-time 10 -s https://api64.ipify.org ; echo' || true
-  fi
 
   echo
   echo ">>> Kiem tra config vua tao:"
