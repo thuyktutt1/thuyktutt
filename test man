@@ -1,0 +1,880 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# ARO Proxy Manager Optimized
+# redsocks + iptables + hostname + watchdog + Telegram
+#
+# Proxy format:
+#   host:port:user:pass
+#
+# Optimized for many VPS:
+# - Setup user nao thi chi sua redsocks/user/iptables cua user do
+# - Khong anh huong user khac: aro, aro1, aro2...
+# - Auto tat IPv6 persistent
+# - Auto stop/disable redsocks.service mac dinh de tranh dung port
+# - Auto verify sau setup, fail thi restart redsocks-user them 1 lan
+# - Proxy chinh bat buoc, toi da 2 proxy du phong optional
+# - Watchdog 30 phut:
+#     OK: khong bao Telegram
+#     FAIL lan 1: restart redsocks + bao Telegram 1 lan
+#     FAIL tiep: thu doi proxy du phong
+#     Proxy moi phai pass 2 lan moi nhan
+#     Het proxy tot: NEED_MANUAL_CHECK
+# - Telegram token luu local tren VPS: /etc/aro-proxy/telegram.conf
+# - Logrotate tu cai khi cai watchdog, giu log 3 ngay
+# ============================================================
+
+BASE_PORT=12345
+REDSOCKS_DIR="/etc/aro-proxy"
+SYSTEMD_DIR="/etc/systemd/system"
+TELEGRAM_CONF="${REDSOCKS_DIR}/telegram.conf"
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "Vui long chay bang root hoac sudo."
+    exit 1
+  fi
+}
+
+pause() {
+  echo
+  read -rp "Nhan Enter de tiep tuc..." _
+}
+
+list_normal_users() {
+  awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd || true
+}
+
+validate_port() {
+  local p="${1:-}"
+  [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+}
+
+user_exists() {
+  id "$1" >/dev/null 2>&1
+}
+
+get_uid() {
+  id -u "$1"
+}
+
+sanitize_user_tag() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
+}
+
+ask_user() {
+  echo "User hien co trong may:"
+  list_normal_users | sed 's/^/ - /'
+  echo
+  read -rp "Nhap user, vi du aro/aro1/aro2: " TARGET_USER
+  TARGET_USER="${TARGET_USER:-}"
+
+  if [[ -z "$TARGET_USER" ]]; then
+    echo "Ban chua nhap user."
+    return 1
+  fi
+
+  if ! user_exists "$TARGET_USER"; then
+    echo "Khong tim thay user '$TARGET_USER'."
+    echo "Hay tao user truoc bang aro-tool.sh."
+    return 1
+  fi
+
+  USER_TAG="$(sanitize_user_tag "$TARGET_USER")"
+  return 0
+}
+
+resolve_ipv4() {
+  local host="$1"
+  if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "$host"
+  else
+    getent ahostsv4 "$host" | awk 'NR==1{print $1}'
+  fi
+}
+
+is_port_listening() {
+  local p="$1"
+  ss -ltn 2>/dev/null | grep -q ":${p} "
+}
+
+next_free_port() {
+  local p="$BASE_PORT"
+  while is_port_listening "$p"; do
+    ((p++))
+  done
+  echo "$p"
+}
+
+extract_local_port_from_conf() {
+  local conf="$1"
+  [[ -f "$conf" ]] || return 1
+  grep -E '^[[:space:]]*local_port[[:space:]]*=' "$conf" | head -n1 | sed -E 's/.*=[[:space:]]*([0-9]+).*/\1/' || true
+}
+
+ensure_dependencies() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt update
+  apt install -y redsocks iptables-persistent curl iproute2 cron
+}
+
+create_dirs() {
+  mkdir -p "$REDSOCKS_DIR"
+}
+
+save_iptables() {
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4
+}
+
+disable_ipv6_persistently() {
+  local sysctl_file="/etc/sysctl.conf"
+
+  grep -q '^net.ipv6.conf.all.disable_ipv6 = 1$' "$sysctl_file" || echo 'net.ipv6.conf.all.disable_ipv6 = 1' >> "$sysctl_file"
+  grep -q '^net.ipv6.conf.default.disable_ipv6 = 1$' "$sysctl_file" || echo 'net.ipv6.conf.default.disable_ipv6 = 1' >> "$sysctl_file"
+  grep -q '^net.ipv6.conf.lo.disable_ipv6 = 1$' "$sysctl_file" || echo 'net.ipv6.conf.lo.disable_ipv6 = 1' >> "$sysctl_file"
+
+  sysctl -p >/dev/null || true
+}
+
+stop_default_redsocks() {
+  systemctl stop redsocks 2>/dev/null || true
+  systemctl disable redsocks 2>/dev/null || true
+}
+
+install_logrotate() {
+  cat > /etc/logrotate.d/aro-watchdog <<'EOF'
+/var/log/check-redsocks-*.log {
+    daily
+    rotate 3
+    missingok
+    notifempty
+    compress
+    copytruncate
+}
+EOF
+}
+
+show_header() {
+  clear || true
+  echo "=============================================="
+  echo " ARO Proxy Manager Optimized"
+  echo " redsocks + watchdog + Telegram"
+  echo " Proxy: host:port:user:pass"
+  echo "=============================================="
+  echo
+}
+
+parse_proxy_line() {
+  local line="$1"
+
+  IFS=':' read -r PROXY_HOST PROXY_PORT PROXY_USER PROXY_PASS EXTRA <<< "$line"
+
+  if [[ -n "${EXTRA:-}" ]]; then
+    echo "Proxy sai dinh dang. Pass khong duoc co dau ':'"
+    return 1
+  fi
+
+  if [[ -z "${PROXY_HOST:-}" || -z "${PROXY_PORT:-}" || -z "${PROXY_USER:-}" || -z "${PROXY_PASS:-}" ]]; then
+    echo "Proxy sai dinh dang."
+    echo "Dung format: host:port:user:pass"
+    return 1
+  fi
+
+  if ! validate_port "$PROXY_PORT"; then
+    echo "Proxy port khong hop le."
+    return 1
+  fi
+
+  return 0
+}
+
+validate_proxy_line_only() {
+  local line="$1"
+  local h p u pw extra
+
+  IFS=':' read -r h p u pw extra <<< "$line"
+
+  if [[ -n "${extra:-}" || -z "${h:-}" || -z "${p:-}" || -z "${u:-}" || -z "${pw:-}" ]]; then
+    return 1
+  fi
+
+  if ! validate_port "$p"; then
+    return 1
+  fi
+
+  local resolved
+  resolved="$(resolve_ipv4 "$h" || true)"
+  [[ -n "${resolved:-}" ]]
+}
+
+write_redsocks_conf() {
+  local conf_file="$1"
+  local log_file="$2"
+  local local_port="$3"
+  local proxy_host="$4"
+  local proxy_port="$5"
+  local proxy_user="$6"
+  local proxy_pass="$7"
+
+  cat > "$conf_file" <<EOF
+base {
+ log_debug = off;
+ log_info = on;
+ log = "file:${log_file}";
+ daemon = off;
+ redirector = iptables;
+}
+
+redsocks {
+ local_ip = 127.0.0.1;
+ local_port = ${local_port};
+
+ ip = ${proxy_host};
+ port = ${proxy_port};
+
+ type = socks5;
+ login = "${proxy_user}";
+ password = "${proxy_pass}";
+}
+EOF
+}
+
+ask_backup_proxies() {
+  local user_tag="$1"
+  local backup_file="$REDSOCKS_DIR/backup-proxies-${user_tag}.txt"
+
+  echo
+  echo "Nhap proxy du phong cho user nay."
+  echo "Tong toi da 2 proxy du phong. Co the bo trong neu chua co."
+  echo "Dung format: host:port:user:pass"
+  echo
+
+  : > "$backup_file"
+
+  for n in 1 2; do
+    while true; do
+      read -rp "Proxy du phong ${n} (Enter de bo qua): " BK_PROXY
+      BK_PROXY="${BK_PROXY:-}"
+
+      if [[ -z "$BK_PROXY" ]]; then
+        echo "# EMPTY_BACKUP_${n}" >> "$backup_file"
+        break
+      fi
+
+      if validate_proxy_line_only "$BK_PROXY"; then
+        echo "$BK_PROXY" >> "$backup_file"
+        break
+      fi
+
+      echo "Proxy du phong ${n} sai dinh dang hoac hostname khong resolve duoc. Nhap lai hoac Enter de bo qua."
+    done
+  done
+
+  chmod 600 "$backup_file"
+
+  echo
+  echo "Da luu proxy du phong tai: $backup_file"
+  echo "Noi dung proxy du phong:"
+  grep -v '^# EMPTY' "$backup_file" || true
+}
+
+verify_user_proxy_with_retry() {
+  local user_name="$1"
+  local service_name="$2"
+
+  echo
+  echo ">>> Verify proxy user ${user_name} lan 1..."
+  IP_TEST="$(su - "$user_name" -c 'curl -4 --max-time 20 -s https://api.ipify.org' 2>/dev/null || true)"
+
+  if [[ "$IP_TEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "OK: ${user_name} IP = ${IP_TEST}"
+    return 0
+  fi
+
+  echo "Lan 1 fail. Dang restart ${service_name} va test lai..."
+  systemctl restart "$service_name"
+  sleep 8
+
+  IP_TEST="$(su - "$user_name" -c 'curl -4 --max-time 20 -s https://api.ipify.org' 2>/dev/null || true)"
+
+  if [[ "$IP_TEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "OK sau retry: ${user_name} IP = ${IP_TEST}"
+    return 0
+  fi
+
+  echo "CANH BAO: ${user_name} van chua ra IP proxy sau retry."
+  return 1
+}
+
+setup_proxy_for_user() {
+  if ! ask_user; then
+    return 1
+  fi
+
+  echo
+  echo "Nhap proxy chinh theo dinh dang:"
+  echo "host:port:user:pass"
+  echo
+  echo "Vi du:"
+  echo "snvn10.tunproxy.com:44188:Dz8qWu:Cht0PT4D"
+  echo
+  read -rp "Nhap proxy chinh: " PROXY_LINE
+
+  if ! parse_proxy_line "$PROXY_LINE"; then
+    return 1
+  fi
+
+  PROXY_IP="$(resolve_ipv4 "$PROXY_HOST" || true)"
+  if [[ -z "${PROXY_IP:-}" ]]; then
+    echo "Khong resolve duoc IPv4 cho proxy host: $PROXY_HOST"
+    return 1
+  fi
+
+  USER_UID="$(get_uid "$TARGET_USER")"
+  USER_TAG="$(sanitize_user_tag "$TARGET_USER")"
+  CONF_FILE="$REDSOCKS_DIR/redsocks-${USER_TAG}.conf"
+  SERVICE_FILE="$SYSTEMD_DIR/redsocks-${USER_TAG}.service"
+  CHAIN_NAME="REDSOCKS_${USER_TAG^^}"
+  LOG_FILE="/var/log/redsocks-${USER_TAG}.log"
+  CURRENT_PROXY_FILE="$REDSOCKS_DIR/current-proxy-${USER_TAG}.txt"
+  STATE_FILE="$REDSOCKS_DIR/watchdog-state-${USER_TAG}.state"
+  SERVICE_NAME="redsocks-${USER_TAG}.service"
+
+  echo
+  echo ">>> Dang cai goi can thiet..."
+  ensure_dependencies
+  create_dirs
+
+  echo ">>> Tat IPv6 persistent..."
+  disable_ipv6_persistently
+
+  echo ">>> Stop/disable redsocks.service mac dinh de tranh dung port..."
+  stop_default_redsocks
+
+  echo ">>> Stop service rieng cua user truoc khi ghi config..."
+  systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+
+  EXISTING_PORT="$(extract_local_port_from_conf "$CONF_FILE" || true)"
+  if [[ -n "${EXISTING_PORT:-}" && "$EXISTING_PORT" =~ ^[0-9]+$ && ! $(is_port_listening "$EXISTING_PORT"; echo $?) == "0" ]]; then
+    LOCAL_PORT="$EXISTING_PORT"
+  else
+    LOCAL_PORT="$(next_free_port)"
+  fi
+
+  echo ">>> User       : $TARGET_USER (UID $USER_UID)"
+  echo ">>> Proxy host : $PROXY_HOST"
+  echo ">>> Resolve IP : $PROXY_IP"
+  echo ">>> Proxy port : $PROXY_PORT"
+  echo ">>> Local port : $LOCAL_PORT"
+  echo
+
+  write_redsocks_conf "$CONF_FILE" "$LOG_FILE" "$LOCAL_PORT" "$PROXY_HOST" "$PROXY_PORT" "$PROXY_USER" "$PROXY_PASS"
+  echo "$PROXY_LINE" > "$CURRENT_PROXY_FILE"
+  chmod 600 "$CURRENT_PROXY_FILE"
+  rm -f "$STATE_FILE"
+
+  cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Redsocks for ${TARGET_USER}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/redsocks -c ${CONF_FILE}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  echo ">>> Dang tao / cap nhat iptables chain rieng cho ${TARGET_USER}..."
+  iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner "$USER_UID" -j "$CHAIN_NAME" 2>/dev/null || true
+  iptables -t nat -F "$CHAIN_NAME" 2>/dev/null || true
+  iptables -t nat -X "$CHAIN_NAME" 2>/dev/null || true
+
+  iptables -t nat -N "$CHAIN_NAME"
+
+  iptables -t nat -A "$CHAIN_NAME" -d 0.0.0.0/8 -j RETURN
+  iptables -t nat -A "$CHAIN_NAME" -d 10.0.0.0/8 -j RETURN
+  iptables -t nat -A "$CHAIN_NAME" -d 127.0.0.0/8 -j RETURN
+  iptables -t nat -A "$CHAIN_NAME" -d 169.254.0.0/16 -j RETURN
+  iptables -t nat -A "$CHAIN_NAME" -d 172.16.0.0/12 -j RETURN
+  iptables -t nat -A "$CHAIN_NAME" -d 192.168.0.0/16 -j RETURN
+  iptables -t nat -A "$CHAIN_NAME" -d 224.0.0.0/4 -j RETURN
+  iptables -t nat -A "$CHAIN_NAME" -d 240.0.0.0/4 -j RETURN
+  iptables -t nat -A "$CHAIN_NAME" -p tcp -j REDIRECT --to-ports "$LOCAL_PORT"
+
+  iptables -t nat -A OUTPUT -p tcp -m owner --uid-owner "$USER_UID" -j "$CHAIN_NAME"
+
+  echo ">>> Dang reload systemd va khoi dong service..."
+  systemctl daemon-reload
+  systemctl enable "$SERVICE_NAME"
+  systemctl restart "$SERVICE_NAME"
+
+  echo ">>> Dang luu iptables..."
+  save_iptables
+
+  ask_backup_proxies "$USER_TAG"
+
+  verify_user_proxy_with_retry "$TARGET_USER" "$SERVICE_NAME" || true
+
+  echo
+  read -rp "Co cai/cap nhat watchdog 30 phut cho user ${TARGET_USER} khong? (y/N): " WANT_WATCHDOG
+  WANT_WATCHDOG="${WANT_WATCHDOG:-N}"
+  if [[ "$WANT_WATCHDOG" =~ ^[Yy]$ ]]; then
+    install_watchdog_for_user "$TARGET_USER" "$USER_TAG" || true
+  fi
+
+  echo
+  echo ">>> Kiem tra service:"
+  systemctl status "$SERVICE_NAME" --no-pager -l || true
+
+  echo
+  echo ">>> Kiem tra config vua tao:"
+  grep -E "local_port|ip =|port =|login =" "$CONF_FILE" || true
+
+  echo
+  echo "=============================================="
+  echo "XONG."
+  echo "User          : ${TARGET_USER}"
+  echo "Proxy chinh   : ${PROXY_LINE}"
+  echo "Resolve IP    : ${PROXY_IP}"
+  echo "Config file   : ${CONF_FILE}"
+  echo "Backup file   : ${REDSOCKS_DIR}/backup-proxies-${USER_TAG}.txt"
+  echo "Service       : ${SERVICE_NAME}"
+  echo "=============================================="
+}
+
+install_watchdog_for_user() {
+  local user_name="${1:-}"
+  local user_tag="${2:-}"
+
+  if [[ -z "$user_name" || -z "$user_tag" ]]; then
+    if ! ask_user; then
+      return 1
+    fi
+    user_name="$TARGET_USER"
+    user_tag="$USER_TAG"
+  fi
+
+  create_dirs
+  install_logrotate
+
+  local script_file="/usr/local/bin/check-redsocks-${user_tag}.sh"
+  local service_name="redsocks-${user_tag}.service"
+  local conf_file="$REDSOCKS_DIR/redsocks-${user_tag}.conf"
+  local backup_file="$REDSOCKS_DIR/backup-proxies-${user_tag}.txt"
+  local current_file="$REDSOCKS_DIR/current-proxy-${user_tag}.txt"
+  local state_file="$REDSOCKS_DIR/watchdog-state-${user_tag}.state"
+  local log_file="/var/log/check-redsocks-${user_tag}.log"
+  local marker="ARO_WATCHDOG_REDSOCKS_${user_tag}"
+
+  cat > "$script_file" <<EOF
+#!/usr/bin/env bash
+set -u
+
+USER_NAME="${user_name}"
+USER_TAG="${user_tag}"
+SERVICE_NAME="${service_name}"
+CONF_FILE="${conf_file}"
+BACKUP_FILE="${backup_file}"
+CURRENT_FILE="${current_file}"
+STATE_FILE="${state_file}"
+LOG_FILE="${log_file}"
+TELEGRAM_CONF="${TELEGRAM_CONF}"
+HOSTNAME_VPS="\$(hostname)"
+
+log() {
+  echo "\$(date '+%F %T') \$*" >> "\$LOG_FILE"
+}
+
+send_tele() {
+  local msg="\$1"
+  if [[ -f "\$TELEGRAM_CONF" ]]; then
+    # shellcheck disable=SC1090
+    source "\$TELEGRAM_CONF"
+    if [[ -n "\${BOT_TOKEN:-}" && -n "\${CHAT_ID:-}" ]]; then
+      curl -s -X POST "https://api.telegram.org/bot\${BOT_TOKEN}/sendMessage" \\
+        -d chat_id="\$CHAT_ID" \\
+        -d text="\$msg" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+check_user_ip() {
+  su - "\$USER_NAME" -c 'curl -4 --max-time 15 -s https://api.ipify.org' 2>/dev/null
+}
+
+is_ip() {
+  [[ "\$1" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$ ]]
+}
+
+parse_proxy() {
+  local line="\$1"
+  IFS=':' read -r P_HOST P_PORT P_USER P_PASS P_EXTRA <<< "\$line"
+  [[ -z "\${P_EXTRA:-}" && -n "\${P_HOST:-}" && -n "\${P_PORT:-}" && -n "\${P_USER:-}" && -n "\${P_PASS:-}" ]]
+}
+
+test_proxy_direct_2x() {
+  local line="\$1"
+  parse_proxy "\$line" || return 1
+  local proxy_url="socks5h://\${P_USER}:\${P_PASS}@\${P_HOST}:\${P_PORT}"
+  local ip1 ip2
+  ip1="\$(curl -s --max-time 15 --proxy "\$proxy_url" https://api.ipify.org || true)"
+  sleep 2
+  ip2="\$(curl -s --max-time 15 --proxy "\$proxy_url" https://api.ipify.org || true)"
+  is_ip "\$ip1" && is_ip "\$ip2" && [[ "\$ip1" == "\$ip2" ]]
+}
+
+get_local_port() {
+  grep -E '^[[:space:]]*local_port[[:space:]]*=' "\$CONF_FILE" | head -n1 | sed -E 's/.*=[[:space:]]*([0-9]+).*/\\1/'
+}
+
+write_conf_proxy() {
+  local line="\$1"
+  parse_proxy "\$line" || return 1
+  local local_port
+  local_port="\$(get_local_port)"
+  [[ -n "\$local_port" ]] || return 1
+
+  cat > "\$CONF_FILE" <<EOC
+base {
+ log_debug = off;
+ log_info = on;
+ log = "file:/var/log/redsocks-\${USER_TAG}.log";
+ daemon = off;
+ redirector = iptables;
+}
+
+redsocks {
+ local_ip = 127.0.0.1;
+ local_port = \${local_port};
+
+ ip = \${P_HOST};
+ port = \${P_PORT};
+
+ type = socks5;
+ login = "\${P_USER}";
+ password = "\${P_PASS}";
+}
+EOC
+
+  echo "\$line" > "\$CURRENT_FILE"
+  chmod 600 "\$CURRENT_FILE" 2>/dev/null || true
+}
+
+build_proxy_pool() {
+  : > /tmp/aro-proxy-pool-\${USER_TAG}.txt
+
+  if [[ -f "\$CURRENT_FILE" ]]; then
+    grep -v '^#' "\$CURRENT_FILE" | grep -v '^$' >> /tmp/aro-proxy-pool-\${USER_TAG}.txt || true
+  fi
+
+  if [[ -f "\$BACKUP_FILE" ]]; then
+    grep -v '^#' "\$BACKUP_FILE" | grep -v '^$' >> /tmp/aro-proxy-pool-\${USER_TAG}.txt || true
+  fi
+
+  awk '!seen[\$0]++' /tmp/aro-proxy-pool-\${USER_TAG}.txt > /tmp/aro-proxy-pool-\${USER_TAG}.uniq
+  mv /tmp/aro-proxy-pool-\${USER_TAG}.uniq /tmp/aro-proxy-pool-\${USER_TAG}.txt
+}
+
+switch_to_next_good_proxy() {
+  build_proxy_pool
+  local pool="/tmp/aro-proxy-pool-\${USER_TAG}.txt"
+  [[ -s "\$pool" ]] || return 1
+
+  local current=""
+  [[ -f "\$CURRENT_FILE" ]] && current="\$(cat "\$CURRENT_FILE" 2>/dev/null || true)"
+
+  mapfile -t PROXIES < "\$pool"
+  local total="\${#PROXIES[@]}"
+  (( total > 0 )) || return 1
+
+  local start_index=0
+  local i
+
+  for i in "\${!PROXIES[@]}"; do
+    if [[ "\${PROXIES[\$i]}" == "\$current" ]]; then
+      start_index=\$((i + 1))
+      break
+    fi
+  done
+
+  for (( offset=0; offset<total; offset++ )); do
+    idx=\$(((start_index + offset) % total))
+    candidate="\${PROXIES[\$idx]}"
+
+    [[ -z "\$candidate" ]] && continue
+    [[ "\$candidate" == "\$current" && "\$total" -gt 1 ]] && continue
+
+    log "TRY_SWITCH user=\$USER_NAME candidate=\$candidate"
+
+    if ! test_proxy_direct_2x "\$candidate"; then
+      log "CANDIDATE_FAIL_2X user=\$USER_NAME candidate=\$candidate"
+      continue
+    fi
+
+    write_conf_proxy "\$candidate" || continue
+    systemctl restart "\$SERVICE_NAME"
+    sleep 10
+
+    local ip
+    ip="\$(check_user_ip || true)"
+
+    if is_ip "\$ip"; then
+      log "SWITCH_OK user=\$USER_NAME ip=\$ip proxy=\$candidate"
+      send_tele "[\${HOSTNAME_VPS}][\$USER_NAME] SWITCH_OK ip=\$ip"
+      rm -f "\$STATE_FILE"
+      return 0
+    fi
+
+    log "SWITCH_STILL_FAIL user=\$USER_NAME proxy=\$candidate"
+  done
+
+  return 1
+}
+
+trim_log() {
+  if [[ -f "\$LOG_FILE" ]]; then
+    tail -n 1000 "\$LOG_FILE" > "/tmp/check-redsocks-\${USER_TAG}.log" && mv "/tmp/check-redsocks-\${USER_TAG}.log" "\$LOG_FILE"
+  fi
+}
+
+IP="\$(check_user_ip || true)"
+
+if is_ip "\$IP"; then
+  log "OK user=\$USER_NAME ip=\$IP"
+  rm -f "\$STATE_FILE"
+  trim_log
+  exit 0
+fi
+
+NOW="\$(date +%s)"
+FAIL_STAGE="none"
+LAST_TS="0"
+
+if [[ -f "\$STATE_FILE" ]]; then
+  IFS='|' read -r FAIL_STAGE LAST_TS < "\$STATE_FILE" || true
+fi
+
+if [[ "\$FAIL_STAGE" == "none" || -z "\$FAIL_STAGE" ]]; then
+  log "FAIL_1 user=\$USER_NAME restart=\$SERVICE_NAME"
+  send_tele "[\${HOSTNAME_VPS}][\$USER_NAME] FAIL detected, restart redsocks"
+  systemctl restart "\$SERVICE_NAME"
+  echo "restart_done|\$NOW" > "\$STATE_FILE"
+  trim_log
+  exit 1
+fi
+
+log "FAIL_2 user=\$USER_NAME try_switch_backup"
+if switch_to_next_good_proxy; then
+  trim_log
+  exit 0
+fi
+
+send_tele "[\${HOSTNAME_VPS}][\$USER_NAME] NEED_MANUAL_CHECK, all proxy candidates failed"
+log "NEED_MANUAL_CHECK user=\$USER_NAME"
+echo "need_manual|\$NOW" > "\$STATE_FILE"
+trim_log
+exit 1
+EOF
+
+  chmod +x "$script_file"
+
+  (
+    crontab -l 2>/dev/null | grep -v "$marker" || true
+    echo "*/30 * * * * $script_file # $marker"
+  ) | crontab -
+
+  echo "Da cai watchdog 30 phut cho $user_name"
+  echo "Da tu dong cai logrotate giu log 3 ngay."
+  echo "Script: $script_file"
+}
+
+remove_watchdog_for_user() {
+  if ! ask_user; then
+    return 1
+  fi
+
+  local marker="ARO_WATCHDOG_REDSOCKS_${USER_TAG}"
+  (
+    crontab -l 2>/dev/null | grep -v "$marker" || true
+  ) | crontab -
+
+  echo "Da xoa watchdog cho ${TARGET_USER}"
+}
+
+show_cron() {
+  echo
+  echo "Cron hien tai:"
+  crontab -l 2>/dev/null || echo "Chua co cron."
+}
+
+test_ip_user() {
+  if ! ask_user; then
+    return 1
+  fi
+
+  echo
+  echo "ROOT IP / IP VPS goc:"
+  curl -4 --max-time 15 -s https://api.ipify.org ; echo
+
+  echo
+  echo "${TARGET_USER} IP / IP proxy cua user:"
+  su - "$TARGET_USER" -c 'curl -4 --max-time 20 -s https://api.ipify.org ; echo' || true
+
+  echo
+  echo "Service redsocks-${USER_TAG}:"
+  systemctl status "redsocks-${USER_TAG}.service" --no-pager -l || true
+
+  echo
+  echo "Config:"
+  grep -nE "local_port|ip =|port =|login =" "$REDSOCKS_DIR/redsocks-${USER_TAG}.conf" 2>/dev/null || true
+
+  echo
+  echo "Listening redsocks ports:"
+  ss -ltnp | grep redsocks || true
+}
+
+setup_telegram() {
+  create_dirs
+
+  echo "Nhap Telegram BOT_TOKEN va CHAT_ID."
+  echo "Token se chi luu local tren VPS tai: $TELEGRAM_CONF"
+  echo "Khong dua token len GitHub."
+  echo
+
+  read -rp "BOT_TOKEN: " BOT_TOKEN_INPUT
+  read -rp "CHAT_ID: " CHAT_ID_INPUT
+
+  if [[ -z "$BOT_TOKEN_INPUT" || -z "$CHAT_ID_INPUT" ]]; then
+    echo "Thieu BOT_TOKEN hoac CHAT_ID."
+    return 1
+  fi
+
+  cat > "$TELEGRAM_CONF" <<EOF
+BOT_TOKEN="${BOT_TOKEN_INPUT}"
+CHAT_ID="${CHAT_ID_INPUT}"
+EOF
+
+  chmod 600 "$TELEGRAM_CONF"
+
+  echo "Da luu Telegram config tai $TELEGRAM_CONF"
+}
+
+test_telegram() {
+  if [[ ! -f "$TELEGRAM_CONF" ]]; then
+    echo "Chua co $TELEGRAM_CONF. Hay chon muc 5 truoc."
+    return 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$TELEGRAM_CONF"
+
+  if [[ -z "${BOT_TOKEN:-}" || -z "${CHAT_ID:-}" ]]; then
+    echo "File Telegram conf thieu BOT_TOKEN hoac CHAT_ID."
+    return 1
+  fi
+
+  local msg="[TEST] $(hostname) gui Telegram thanh cong"
+  curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    -d chat_id="$CHAT_ID" \
+    -d text="$msg"
+  echo
+}
+
+view_watchdog_log() {
+  if ! ask_user; then
+    return 1
+  fi
+
+  local log_file="/var/log/check-redsocks-${USER_TAG}.log"
+  echo
+  echo "Log: $log_file"
+  tail -n 80 "$log_file" 2>/dev/null || echo "Chua co log."
+}
+
+reset_watchdog_log() {
+  if ! ask_user; then
+    return 1
+  fi
+
+  local log_file="/var/log/check-redsocks-${USER_TAG}.log"
+  : > "$log_file"
+  echo "Da reset log: $log_file"
+}
+
+main_menu() {
+  require_root
+
+  while true; do
+    show_header
+    echo "1) Setup / doi proxy chinh + toi da 2 proxy du phong cho 1 user"
+    echo "2) Cai / cap nhat watchdog 30 phut cho 1 user"
+    echo "3) Xoa watchdog cho 1 user"
+    echo "4) Test IP root va IP user"
+    echo "5) Cai / cap nhat Telegram bao loi"
+    echo "6) Test gui Telegram"
+    echo "7) Xem cron hien tai"
+    echo "8) Xem log watchdog"
+    echo "9) Xoa / reset log watchdog"
+    echo "0) Thoat"
+    echo
+    read -rp "Chon: " CHOICE
+
+    case "${CHOICE:-}" in
+      1)
+        setup_proxy_for_user || true
+        pause
+        ;;
+      2)
+        if ask_user; then
+          install_watchdog_for_user "$TARGET_USER" "$USER_TAG" || true
+        fi
+        pause
+        ;;
+      3)
+        remove_watchdog_for_user || true
+        pause
+        ;;
+      4)
+        test_ip_user || true
+        pause
+        ;;
+      5)
+        setup_telegram || true
+        pause
+        ;;
+      6)
+        test_telegram || true
+        pause
+        ;;
+      7)
+        show_cron
+        pause
+        ;;
+      8)
+        view_watchdog_log || true
+        pause
+        ;;
+      9)
+        reset_watchdog_log || true
+        pause
+        ;;
+      0)
+        echo "Thoat."
+        exit 0
+        ;;
+      *)
+        echo "Lua chon khong hop le."
+        pause
+        ;;
+    esac
+  done
+}
+
+main_menu "$@"
