@@ -1,0 +1,245 @@
+#!/bin/bash
+
+# ==========================================================
+# ARO Uptime Telegram Alert
+# Safe for GitHub: NO token inside this script.
+#
+# Features:
+# - Alert Telegram when a user first gets uptime > 0
+# - Do not alert the same user/IP again
+# - Alert "ALL DONE" once when all target users pass uptime > 0
+# - Install hourly cron
+# - Test Telegram
+#
+# Config file:
+# /etc/aro-proxy/telegram.conf
+#
+# Expected config:
+# BOT_TOKEN="123456789:ABC..."
+# CHAT_ID="123456789"
+# ==========================================================
+
+CONFIG_FILE="/etc/aro-proxy/telegram.conf"
+STATE_PASS="/root/aro-uptime-pass.state"
+STATE_DONE="/root/aro-uptime-all-done.state"
+SCRIPT_PATH="/root/aro-uptime-telegram-alert.sh"
+
+DEFAULT_USERS="aro aro1 aro2 aro3 aro4 aro5 aro6 aro7 aro8 aro9 aro10 aro11 aro12 aro13 aro14 aro15"
+
+mkdir -p /etc/aro-proxy
+
+send_telegram() {
+  local msg="$1"
+
+  if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: Telegram config not found: $CONFIG_FILE"
+    echo "Run: $0 setup-telegram"
+    exit 1
+  fi
+
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+
+  if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
+    echo "ERROR: BOT_TOKEN or CHAT_ID is empty in $CONFIG_FILE"
+    exit 1
+  fi
+
+  curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+    -d chat_id="$CHAT_ID" \
+    --data-urlencode text="$msg" >/dev/null
+}
+
+setup_telegram() {
+  echo "Nhap Telegram BOT_TOKEN va CHAT_ID."
+  echo "Token chi luu local tren VPS tai: $CONFIG_FILE"
+  echo "Khong dua token len GitHub."
+  echo
+
+  read -rp "BOT_TOKEN: " BOT_TOKEN
+  read -rp "CHAT_ID: " CHAT_ID
+
+  cat > "$CONFIG_FILE" <<EOF
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+EOF
+
+  chmod 600 "$CONFIG_FILE"
+
+  echo "Da luu Telegram config vao: $CONFIG_FILE"
+}
+
+test_telegram() {
+  send_telegram "✅ Test Telegram OK
+
+VPS: $(hostname)
+Time: $(date)"
+  echo "Da gui tin test Telegram."
+}
+
+check_uptime() {
+  local USERS="${USERS:-$DEFAULT_USERS}"
+
+  touch "$STATE_PASS"
+
+  local TOTAL=0
+  local PASSED=0
+
+  local SUMMARY
+  SUMMARY="📡 ARO UPTIME SUMMARY
+
+VPS: $(hostname)
+Time: $(date)
+
+"
+
+  for u in $USERS; do
+    if id "$u" >/dev/null 2>&1; then
+      TOTAL=$((TOTAL + 1))
+
+      LOG="/home/$u/.local/share/com.aro.ARONetwork/logs/ARO Desktop.log"
+
+      CURLIP=$(su - "$u" -c 'curl -4 --max-time 10 -s https://api.ipify.org ; echo' 2>/dev/null)
+      AROIP=$(grep -o '"publicIp":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+      CONN=$(grep -o '"connect":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+      UPTIME=$(grep -o '"uptime":[0-9.]*' "$LOG" 2>/dev/null | tail -1 | cut -d':' -f2)
+      TODAY=$(grep -o '"today":[0-9.]*' "$LOG" 2>/dev/null | tail -1 | cut -d':' -f2)
+
+      [ -z "$CURLIP" ] && CURLIP="no_curl"
+      [ -z "$AROIP" ] && AROIP="no_ip"
+      [ -z "$CONN" ] && CONN="no_log"
+      [ -z "$UPTIME" ] && UPTIME="0"
+      [ -z "$TODAY" ] && TODAY="0"
+
+      if [ "$UPTIME" != "0" ] && [ "$UPTIME" != "no_log" ]; then
+        PASSED=$((PASSED + 1))
+        STATUS="✅"
+        KEY="$u|$AROIP"
+
+        if ! grep -Fxq "$KEY" "$STATE_PASS"; then
+          MSG="✅ ARO UPTIME PASS
+
+VPS: $(hostname)
+User: $u
+Curl IP: $CURLIP
+ARO IP: $AROIP
+Connect: $CONN
+Uptime: $UPTIME
+Today: $TODAY
+Time: $(date)
+
+Giữ con này, không restart / không đổi proxy."
+
+          send_telegram "$MSG"
+          echo "$KEY" >> "$STATE_PASS"
+        fi
+      else
+        if [ "$CONN" = "connected" ]; then
+          STATUS="⚠️"
+        else
+          STATUS="❌"
+        fi
+      fi
+
+      SUMMARY+="$STATUS $u | IP=$AROIP | connect=$CONN | uptime=$UPTIME | today=$TODAY
+"
+    fi
+  done
+
+  SUMMARY+="
+Progress: $PASSED/$TOTAL pass uptime > 0"
+
+  if [ "$TOTAL" -gt 0 ] && [ "$PASSED" -eq "$TOTAL" ]; then
+    if [ ! -f "$STATE_DONE" ]; then
+      MSG="🎉 ARO HOÀN TẤT HẾT
+
+VPS: $(hostname)
+Tất cả user mục tiêu đã uptime > 0.
+
+Progress: $PASSED/$TOTAL
+
+$SUMMARY
+
+Không restart / không đổi proxy các user đã pass."
+
+      send_telegram "$MSG"
+      touch "$STATE_DONE"
+    fi
+  fi
+
+  echo "$SUMMARY"
+}
+
+install_cron_hourly() {
+  cp "$0" "$SCRIPT_PATH"
+  chmod +x "$SCRIPT_PATH"
+
+  crontab -l 2>/dev/null | grep -v "aro-uptime-telegram-alert.sh check" | crontab -
+  (crontab -l 2>/dev/null; echo "0 * * * * $SCRIPT_PATH check >/dev/null 2>&1") | crontab -
+
+  echo "Da cai cron check moi 1 tieng:"
+  crontab -l | grep "aro-uptime-telegram-alert.sh"
+}
+
+reset_state() {
+  rm -f "$STATE_PASS" "$STATE_DONE"
+  echo "Da reset state. Lan check tiep theo se bao lai cac user uptime > 0."
+}
+
+show_state() {
+  echo "=== PASS STATE ==="
+  cat "$STATE_PASS" 2>/dev/null || echo "No pass state"
+
+  echo
+  echo "=== ALL DONE STATE ==="
+  if [ -f "$STATE_DONE" ]; then
+    echo "ALL DONE already alerted"
+  else
+    echo "ALL DONE not alerted yet"
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  $0 setup-telegram     Nhap BOT_TOKEN + CHAT_ID, luu local
+  $0 test-telegram      Test gui Telegram
+  $0 check              Check uptime, bao Telegram neu co user moi pass
+  $0 install-cron       Cai cron check moi 1 tieng
+  $0 reset-state        Xoa state de bao lai tu dau
+  $0 show-state         Xem user da bao roi
+  $0 help               Huong dan
+
+Optional:
+  USERS="aro aro2 aro3 aro4 aro5" $0 check
+EOF
+}
+
+case "$1" in
+  setup-telegram)
+    setup_telegram
+    ;;
+  test-telegram)
+    test_telegram
+    ;;
+  check)
+    check_uptime
+    ;;
+  install-cron)
+    install_cron_hourly
+    ;;
+  reset-state)
+    reset_state
+    ;;
+  show-state)
+    show_state
+    ;;
+  help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown option: $1"
+    usage
+    exit 1
+    ;;
+esac
