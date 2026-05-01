@@ -1,25 +1,13 @@
 #!/bin/bash
 
 # ==========================================================
-# ARO Uptime Telegram Alert
+# ARO Telegram Uptime Alert Menu
 # Safe for GitHub: NO token inside this script.
-#
-# Features:
-# - Alert Telegram when a user first gets uptime > 0
-# - Do not alert the same user/IP again
-# - Alert "ALL DONE" once when all target users pass uptime > 0
-# - Install hourly cron
-# - Test Telegram
-#
-# Config file:
-# /etc/aro-proxy/telegram.conf
-#
-# Expected config:
-# BOT_TOKEN="123456789:ABC..."
-# CHAT_ID="123456789"
+# Token local file: /etc/aro-proxy/telegram.conf
 # ==========================================================
 
 CONFIG_FILE="/etc/aro-proxy/telegram.conf"
+USERS_FILE="/etc/aro-proxy/uptime-users.conf"
 STATE_PASS="/root/aro-uptime-pass.state"
 STATE_DONE="/root/aro-uptime-all-done.state"
 SCRIPT_PATH="/root/aro-uptime-telegram-alert.sh"
@@ -28,21 +16,29 @@ DEFAULT_USERS="aro aro1 aro2 aro3 aro4 aro5 aro6 aro7 aro8 aro9 aro10 aro11 aro1
 
 mkdir -p /etc/aro-proxy
 
+load_users() {
+  if [ -f "$USERS_FILE" ]; then
+    USERS=$(cat "$USERS_FILE")
+  else
+    USERS="$DEFAULT_USERS"
+  fi
+}
+
 send_telegram() {
   local msg="$1"
 
   if [ ! -f "$CONFIG_FILE" ]; then
-    echo "ERROR: Telegram config not found: $CONFIG_FILE"
-    echo "Run: $0 setup-telegram"
-    exit 1
+    echo "❌ Chưa có Telegram config: $CONFIG_FILE"
+    echo "Vào option 1 để nhập BOT_TOKEN + CHAT_ID."
+    return 1
   fi
 
-  # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 
   if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
-    echo "ERROR: BOT_TOKEN or CHAT_ID is empty in $CONFIG_FILE"
-    exit 1
+    echo "❌ BOT_TOKEN hoặc CHAT_ID đang trống."
+    echo "Vào option 1 để nhập lại."
+    return 1
   fi
 
   curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
@@ -51,9 +47,11 @@ send_telegram() {
 }
 
 setup_telegram() {
-  echo "Nhap Telegram BOT_TOKEN va CHAT_ID."
-  echo "Token chi luu local tren VPS tai: $CONFIG_FILE"
-  echo "Khong dua token len GitHub."
+  echo "=============================================="
+  echo " Nhập Telegram BOT_TOKEN và CHAT_ID"
+  echo " Token chỉ lưu local tại: $CONFIG_FILE"
+  echo " Không đưa token lên GitHub."
+  echo "=============================================="
   echo
 
   read -rp "BOT_TOKEN: " BOT_TOKEN
@@ -66,7 +64,7 @@ EOF
 
   chmod 600 "$CONFIG_FILE"
 
-  echo "Da luu Telegram config vao: $CONFIG_FILE"
+  echo "✅ Đã lưu Telegram config."
 }
 
 test_telegram() {
@@ -74,18 +72,57 @@ test_telegram() {
 
 VPS: $(hostname)
 Time: $(date)"
-  echo "Da gui tin test Telegram."
+  echo "✅ Đã gửi tin test Telegram."
+}
+
+set_users() {
+  echo "User hiện tại đang theo dõi:"
+  if [ -f "$USERS_FILE" ]; then
+    cat "$USERS_FILE"
+  else
+    echo "$DEFAULT_USERS"
+  fi
+
+  echo
+  echo "Nhập danh sách user muốn theo dõi."
+  echo "Ví dụ VPS 5 node:"
+  echo "aro aro2 aro3 aro4 aro5"
+  echo
+  echo "Ví dụ VPS 15 node:"
+  echo "aro aro1 aro2 aro3 aro4 aro5 aro6 aro7 aro8 aro9 aro10 aro11 aro12 aro13 aro14 aro15"
+  echo
+
+  read -rp "USERS: " NEW_USERS
+
+  if [ -z "$NEW_USERS" ]; then
+    echo "❌ Không được để trống."
+    return
+  fi
+
+  echo "$NEW_USERS" > "$USERS_FILE"
+  chmod 600 "$USERS_FILE"
+
+  echo "✅ Đã lưu danh sách user theo dõi:"
+  cat "$USERS_FILE"
+}
+
+show_users() {
+  echo "=== USERS ĐANG THEO DÕI ==="
+  if [ -f "$USERS_FILE" ]; then
+    cat "$USERS_FILE"
+  else
+    echo "$DEFAULT_USERS"
+  fi
 }
 
 check_uptime() {
-  local USERS="${USERS:-$DEFAULT_USERS}"
+  load_users
 
   touch "$STATE_PASS"
 
-  local TOTAL=0
-  local PASSED=0
+  TOTAL=0
+  PASSED=0
 
-  local SUMMARY
   SUMMARY="📡 ARO UPTIME SUMMARY
 
 VPS: $(hostname)
@@ -143,11 +180,16 @@ Giữ con này, không restart / không đổi proxy."
 
       SUMMARY+="$STATUS $u | IP=$AROIP | connect=$CONN | uptime=$UPTIME | today=$TODAY
 "
+    else
+      SUMMARY+="❌ $u | user not found
+"
     fi
   done
 
   SUMMARY+="
 Progress: $PASSED/$TOTAL pass uptime > 0"
+
+  echo "$SUMMARY"
 
   if [ "$TOTAL" -gt 0 ] && [ "$PASSED" -eq "$TOTAL" ]; then
     if [ ! -f "$STATE_DONE" ]; then
@@ -166,8 +208,6 @@ Không restart / không đổi proxy các user đã pass."
       touch "$STATE_DONE"
     fi
   fi
-
-  echo "$SUMMARY"
 }
 
 install_cron_hourly() {
@@ -177,69 +217,99 @@ install_cron_hourly() {
   crontab -l 2>/dev/null | grep -v "aro-uptime-telegram-alert.sh check" | crontab -
   (crontab -l 2>/dev/null; echo "0 * * * * $SCRIPT_PATH check >/dev/null 2>&1") | crontab -
 
-  echo "Da cai cron check moi 1 tieng:"
+  echo "✅ Đã cài cron check mỗi 1 tiếng."
   crontab -l | grep "aro-uptime-telegram-alert.sh"
+}
+
+remove_cron() {
+  crontab -l 2>/dev/null | grep -v "aro-uptime-telegram-alert.sh check" | crontab -
+  echo "✅ Đã xóa cron Telegram uptime alert."
 }
 
 reset_state() {
   rm -f "$STATE_PASS" "$STATE_DONE"
-  echo "Da reset state. Lan check tiep theo se bao lai cac user uptime > 0."
+  echo "✅ Đã reset state. Lần check sau sẽ báo lại các user uptime > 0."
 }
 
 show_state() {
-  echo "=== PASS STATE ==="
-  cat "$STATE_PASS" 2>/dev/null || echo "No pass state"
+  echo "=== USER/IP ĐÃ BÁO PASS ==="
+  cat "$STATE_PASS" 2>/dev/null || echo "Chưa có"
 
   echo
-  echo "=== ALL DONE STATE ==="
+  echo "=== TRẠNG THÁI HOÀN TẤT HẾT ==="
   if [ -f "$STATE_DONE" ]; then
-    echo "ALL DONE already alerted"
+    echo "Đã báo hoàn tất hết."
   else
-    echo "ALL DONE not alerted yet"
+    echo "Chưa báo hoàn tất hết."
   fi
 }
 
-usage() {
-  cat <<EOF
-Usage:
-  $0 setup-telegram     Nhap BOT_TOKEN + CHAT_ID, luu local
-  $0 test-telegram      Test gui Telegram
-  $0 check              Check uptime, bao Telegram neu co user moi pass
-  $0 install-cron       Cai cron check moi 1 tieng
-  $0 reset-state        Xoa state de bao lai tu dau
-  $0 show-state         Xem user da bao roi
-  $0 help               Huong dan
+show_cron() {
+  echo "=== CRON HIỆN TẠI ==="
+  crontab -l 2>/dev/null || echo "Chưa có cron."
+}
 
-Optional:
-  USERS="aro aro2 aro3 aro4 aro5" $0 check
-EOF
+menu() {
+  clear
+  echo "=============================================="
+  echo " ARO Telegram Uptime Alert"
+  echo " Báo con nào uptime > 0 + báo hoàn tất hết"
+  echo "=============================================="
+  echo
+  echo "1) Nhập / cập nhật Telegram BOT_TOKEN + CHAT_ID"
+  echo "2) Test gửi Telegram"
+  echo "3) Cài / đổi danh sách user cần theo dõi"
+  echo "4) Xem danh sách user đang theo dõi"
+  echo "5) Check uptime ngay"
+  echo "6) Cài cron check mỗi 1 tiếng"
+  echo "7) Xóa cron"
+  echo "8) Xem state đã báo"
+  echo "9) Reset state để báo lại từ đầu"
+  echo "10) Xem cron hiện tại"
+  echo "0) Thoát"
+  echo
+  read -rp "Chọn option: " CHOICE
+
+  case "$CHOICE" in
+    1) setup_telegram ;;
+    2) test_telegram ;;
+    3) set_users ;;
+    4) show_users ;;
+    5) check_uptime ;;
+    6) install_cron_hourly ;;
+    7) remove_cron ;;
+    8) show_state ;;
+    9) reset_state ;;
+    10) show_cron ;;
+    0) exit 0 ;;
+    *) echo "❌ Option không hợp lệ." ;;
+  esac
+
+  echo
+  read -rp "Nhấn Enter để quay lại menu..."
+  menu
 }
 
 case "$1" in
-  setup-telegram)
-    setup_telegram
-    ;;
-  test-telegram)
-    test_telegram
-    ;;
-  check)
-    check_uptime
-    ;;
-  install-cron)
-    install_cron_hourly
-    ;;
-  reset-state)
-    reset_state
-    ;;
-  show-state)
-    show_state
-    ;;
-  help|"")
-    usage
-    ;;
+  setup-telegram) setup_telegram ;;
+  test-telegram) test_telegram ;;
+  set-users) set_users ;;
+  show-users) show_users ;;
+  check) check_uptime ;;
+  install-cron) install_cron_hourly ;;
+  remove-cron) remove_cron ;;
+  show-state) show_state ;;
+  reset-state) reset_state ;;
+  show-cron) show_cron ;;
+  menu|"") menu ;;
   *)
-    echo "Unknown option: $1"
-    usage
-    exit 1
+    echo "Usage:"
+    echo "$0 menu"
+    echo "$0 setup-telegram"
+    echo "$0 test-telegram"
+    echo "$0 set-users"
+    echo "$0 check"
+    echo "$0 install-cron"
+    echo "$0 reset-state"
     ;;
 esac
