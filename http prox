@@ -1,24 +1,40 @@
 #!/bin/bash
 
-echo "===== SETUP REDSOCKS2 (HTTP SUPPORT) ====="
+echo "===== ARO PROXY MANAGER (HTTP + SOCKS AUTO) ====="
 
-# 1. Install redsocks2
-echo "[+] Installing redsocks2..."
-apt update -y >/dev/null 2>&1
-apt install redsocks2 -y
+CONFIG="/etc/redsocks.conf"
 
-# 2. Stop old redsocks (if exists)
-echo "[+] Stopping old redsocks..."
-systemctl stop redsocks 2>/dev/null
+read -p "Nhập proxy (vd: http://user:pass@ip:port hoặc socks5://...): " PROXY
 
-# 3. Backup config
-echo "[+] Backup config..."
-cp /etc/redsocks.conf /etc/redsocks.conf.bak 2>/dev/null
+# Detect type
+if [[ $PROXY == http* ]]; then
+    TYPE="http-connect"
+elif [[ $PROXY == socks5* ]]; then
+    TYPE="socks5"
+else
+    echo "❌ Không nhận dạng được proxy"
+    exit 1
+fi
 
-# 4. Create new config (HTTP ready)
-echo "[+] Writing new config..."
+# Parse proxy
+proto_removed=$(echo $PROXY | sed 's|.*://||')
+user=$(echo $proto_removed | cut -d':' -f1)
+pass=$(echo $proto_removed | cut -d':' -f2 | cut -d'@' -f1)
+ip=$(echo $proto_removed | cut -d'@' -f2 | cut -d':' -f1)
+port=$(echo $proto_removed | awk -F: '{print $NF}')
 
-cat > /etc/redsocks.conf << 'EOF'
+echo
+echo "===== PARSED ====="
+echo "TYPE: $TYPE"
+echo "IP: $ip"
+echo "PORT: $port"
+echo "USER: $user"
+
+# Backup config
+cp $CONFIG ${CONFIG}.bak 2>/dev/null
+
+# Write new config
+cat > $CONFIG <<EOF
 base {
     log_debug = off;
     log_info = on;
@@ -31,54 +47,25 @@ redsocks {
     local_ip = 127.0.0.1;
     local_port = 12345;
 
-    ip = 0.0.0.0;
-    port = 0000;
+    ip = $ip;
+    port = $port;
 
-    login = "user";
-    password = "pass";
+    login = "$user";
+    password = "$pass";
 
-    type = http-connect;
+    type = $TYPE;
 }
 EOF
 
-# 5. Fix service to use redsocks2
-echo "[+] Updating systemd service..."
-
-SERVICE_FILE="/etc/systemd/system/redsocks.service"
-
-if [ ! -f "$SERVICE_FILE" ]; then
-cat > $SERVICE_FILE << 'EOF'
-[Unit]
-Description=Redsocks Proxy Redirector
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/redsocks2 -c /etc/redsocks.conf
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-else
-    sed -i 's|/usr/sbin/redsocks|/usr/bin/redsocks2|g' $SERVICE_FILE
-fi
-
-# 6. Reload systemd
-echo "[+] Reloading systemd..."
-systemctl daemon-reexec
-systemctl daemon-reload
-
-# 7. Start service
-echo "[+] Starting redsocks2..."
-systemctl enable redsocks
+echo
+echo "===== RESTART REDSOCKS ====="
 systemctl restart redsocks
 
-# 8. Status check
-echo
-echo "===== STATUS ====="
-systemctl status redsocks --no-pager
+sleep 2
 
 echo
-echo "===== DONE ====="
-echo "👉 Bạn chỉ cần sửa /etc/redsocks.conf với proxy thật"
-echo "👉 type = http-connect đã sẵn sàng"
+echo "===== TEST ====="
+curl -s https://api.ipify.org
+echo
+
+echo "✅ DONE"
