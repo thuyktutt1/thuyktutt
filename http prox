@@ -1,0 +1,75 @@
+#!/bin/bash
+
+PROXY_FILE="proxy.txt"
+GOOD_PROXY_FILE="good_proxy.txt"
+
+echo "===== ARO AUTO PROXY TOOL ====="
+
+if [ ! -f "$PROXY_FILE" ]; then
+  echo "❌ Không tìm thấy proxy.txt"
+  exit 1
+fi
+
+> $GOOD_PROXY_FILE
+
+echo
+echo "===== TEST PROXY ====="
+
+while IFS= read -r line; do
+  IFS=':' read -r ip port user pass <<< "$line"
+  proxy="http://$user:$pass@$ip:$port"
+
+  echo "Testing $ip:$port..."
+
+  ok=0
+  fail=0
+
+  for i in {1..10}; do
+    res=$(curl -x "$proxy" -4 --max-time 8 -s https://api.ipify.org)
+    if [ -n "$res" ]; then
+      ((ok++))
+    else
+      ((fail++))
+    fi
+  done
+
+  if [ $fail -le 2 ]; then
+    echo "✅ GOOD"
+    echo "$line" >> $GOOD_PROXY_FILE
+  else
+    echo "❌ BAD"
+  fi
+
+  echo "OK=$ok FAIL=$fail"
+  echo "----------------------"
+
+done < "$PROXY_FILE"
+
+echo
+echo "===== GÁN PROXY ====="
+
+mapfile -t proxies < $GOOD_PROXY_FILE
+
+users=$(awk -F: '$6 ~ /^\/home\// {print $1}' /etc/passwd | grep '^aro')
+
+i=0
+for u in $users; do
+  if [ $i -ge ${#proxies[@]} ]; then
+    break
+  fi
+
+  proxy_line=${proxies[$i]}
+  IFS=':' read -r ip port user pass <<< "$proxy_line"
+
+  echo "Gán $u -> $ip:$port"
+
+  # Ghi proxy vào file (tùy tool bạn đang dùng)
+  mkdir -p /home/$u/.proxy
+  echo "http://$user:$pass@$ip:$port" > /home/$u/.proxy/http_proxy
+  chown -R $u:$u /home/$u/.proxy
+
+  ((i++))
+done
+
+echo
+echo "✅ DONE: $(wc -l < $GOOD_PROXY_FILE) proxy OK"
