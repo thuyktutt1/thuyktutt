@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+# =======================
+# CONFIG
+# =======================
+BOT_TOKEN="YOUR_BOT_TOKEN"
+CHAT_ID="YOUR_CHAT_ID"
+
+# VPS NAME (auto)
+VPS_NAME=$(hostname)
+
+# TIME VN
+VN_TIME=$(TZ=Asia/Ho_Chi_Minh date '+%Y-%m-%d %H:%M:%S')
+
+# =======================
+# MESSAGE HEADER
+# =======================
+MSG="📡 ARO REPORT
+🖥 VPS: $VPS_NAME
+⏰ $VN_TIME (VN)
+-------------------------
+"
+
+# =======================
+# LOOP USERS
+# =======================
+for home in /home/*; do
+  u=$(basename "$home")
+
+  LOG="$home/.local/share/com.aro.ARONetwork/logs/ARO Desktop.log"
+
+  [[ -d "$home" ]] || continue
+
+  CURLIP=$(sudo -u "$u" curl -4 --max-time 8 -s https://api.ipify.org 2>/dev/null)
+
+  if [[ ! -f "$LOG" ]]; then
+    MSG+="$u | NO_LOG | curl=$CURLIP
+"
+    continue
+  fi
+
+  AROIP=$(grep -o '"publicIp":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+  CONN=$(grep -o '"connect":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+  UPTIME=$(grep -o '"uptime":[0-9.]*' "$LOG" 2>/dev/null | tail -1 | cut -d':' -f2)
+
+  AROIP=${AROIP:-"-"}
+  CONN=${CONN:-"-"}
+  UPTIME=${UPTIME:-0}
+
+  STATUS="OK"
+  [[ "$CONN" != "connected" ]] && STATUS="DOWN"
+
+  MSG+="$u | $STATUS
+curl=$CURLIP | aroip=$AROIP | uptime=$UPTIME
+
+"
+done
+
+# =======================
+# SEND TELEGRAM
+# =======================
+curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+  -d chat_id="$CHAT_ID" \
+  -d text="$MSG" \
+  -d disable_web_page_preview=true >/dev/null
+
+echo "DONE"
