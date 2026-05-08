@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+set -u
+
+# =========================================================
+# ARO WATCHDOG PRO
+#
+# FEATURES
+# - nhập user trực tiếp
+# - check curl IP
+# - check AROIP
+# - check connect=connected
+# - stagger delay
+# - fail counter
+# - restart redsocks
+# - restart ARO GUI
+# - terminate XFCE session
+# - Telegram alert
+#
+# RUN:
+#   bash aro-watchdog.sh
+#
+# =========================================================
+
+# =========================================================
+# CHỌN USER
+# =========================================================
+
+echo
+echo "===== USER AVAILABLE ====="
+getent passwd | awk -F: '$1 ~ /^aro[0-9]*$/ {print $1}' | sort -V
+echo
+
+read -rp "Nhap user (vd: aro8): " USER_NAME
+
+if [[ -z "$USER_NAME" ]]; then
+    echo "Chua nhap user"
+    exit 1
+fi
+
+id "$USER_NAME" >/dev/null 2>&1 || {
+    echo "User khong ton tai"
+    exit 1
+}
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+BASE_DIR="/etc/aro-watchdog"
+
+mkdir -p "$BASE_DIR"
+
+STATE_FILE="$BASE_DIR/${USER_NAME}.state"
+
+ARO_LOG="/home/${USER_NAME}/.local/share/com.aro.ARONetwork/logs/ARO Desktop.log"
+
+LOG_FILE="/var/log/aro-watchdog-${USER_NAME}.log"
+
+TELEGRAM_CONF="/etc/aro-proxy/telegram.conf"
+
+MAX_LOG_LINES=2000
+
+# =========================================================
+# STAGGER DELAY
+# =========================================================
+
+USER_NUM=$(echo "$USER_NAME" | grep -o '[0-9]*$')
+
+[[ -z "$USER_NUM" ]] && USER_NUM=0
+
+SLEEP_DELAY=$(( USER_NUM * 15 ))
+
+echo
+echo "Delay ${SLEEP_DELAY}s..."
+sleep "$SLEEP_DELAY"
+
+# =========================================================
+# LOG
+# =========================================================
+
+log() {
+    echo "$(date '+%F %T') $*" >> "$LOG_FILE"
+}
+
+trim_logs() {
+
+    if [[ -f "$LOG_FILE" ]]; then
+        tail -n "$MAX_LOG_LINES" "$LOG_FILE" > /tmp/aro-watchdog.tmp
+        mv /tmp/aro-watchdog.tmp "$LOG_FILE"
+    fi
+
+    if [[ -f "$ARO_LOG" ]]; then
+        tail -n 3000 "$ARO_LOG" > /tmp/aro-log.tmp
+        mv /tmp/aro-log.tmp "$ARO_LOG"
+    fi
+}
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+send_tele() {
+
+    local msg="$1"
+
+    [[ -f "$TELEGRAM_CONF" ]] || return
+
+    # shellcheck disable=SC1090
+    source "$TELEGRAM_CONF"
+
+    [[ -z "${BOT_TOKEN:-}" ]] && return
+    [[ -z "${CHAT_ID:-}" ]] && return
+
+    curl -s -X POST \
+        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d chat_id="${CHAT_ID}" \
+        -d text="$msg" \
+        >/dev/null 2>&1 || true
+}
+
+# =========================================================
+# CHECK CURL IP
+# =========================================================
+
+check_curl_ip() {
+
+    su - "$USER_NAME" -c \
+        'curl -4 --max-time 20 -s https://api.ipify.org' \
+        2>/dev/null
+}
+
+is_ip() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+# =========================================================
+# CHECK ARO STATUS
+# =========================================================
+
+check_aro_status() {
+
+    [[ -f "$ARO_LOG" ]] || return 1
+
+    AROIP=$(grep -o '"publicIp":"[^"]*"' "$ARO_LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+
+    CONN=$(grep -o '"connect":"[^"]*"' "$ARO_LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+
+    echo
+    echo "CURLIP : $IP"
+    echo "AROIP  : $AROIP"
+    echo "CONNECT: $CONN"
+
+    [[ -n "$AROIP" && "$CONN" == "connected" ]]
+}
+
+# =========================================================
+# RESTART REDSOCKS
+# =========================================================
+
+restart_redsocks() {
+
+    local svc="redsocks-${USER_NAME}.service"
+
+    if systemctl list-unit-files | grep -q "^${svc}"; then
+
+        echo
+        echo "Restart redsocks..."
+
+        log "restart redsocks"
+
+        systemctl restart "$svc"
+
+        sleep 10
+    fi
+}
+
+# =========================================================
+# RESTART ARO GUI
+# =========================================================
+
+restart_aro_gui() {
+
+    echo
+    echo "Restart ARO GUI..."
+
+    log "restart aro gui"
+
+    pkill -u "$USER_NAME" -f '/usr/bin/ARO' 2>/dev/null || true
+
+    sleep 5
+
+    DISPLAY_NUM=$(w -h | awk -v u="$USER_NAME" '$1==u {print $3}' | head -1)
+
+    [[ -z "$DISPLAY_NUM" ]] && DISPLAY_NUM=":99"
+
+    su - "$USER_NAME" -c \
+        "export DISPLAY=$DISPLAY_NUM && nohup /usr/bin/ARO >/dev/null 2>&1 &"
+
+    sleep 35
+}
+
+# =========================================================
+# HARD RESTART SESSION
+# =========================================================
+
+hard_restart_session() {
+
+    echo
+    echo "Hard restart session..."
+
+    log "hard restart session"
+
+    loginctl terminate-user "$USER_NAME"
+
+    sleep 15
+
+    DISPLAY_NUM=":99"
+
+    su - "$USER_NAME" -c \
+        "export DISPLAY=$DISPLAY_NUM && nohup /usr/bin/ARO >/dev/null 2>&1 &"
+
+    sleep 45
+}
+
+# =========================================================
+# FAIL STATE
+# =========================================================
+
+FAIL_COUNT=0
+
+if [[ -f "$STATE_FILE" ]]; then
+    FAIL_COUNT=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
+fi
+
+save_fail() {
+    echo "$1" > "$STATE_FILE"
+}
+
+reset_fail() {
+    rm -f "$STATE_FILE"
+}
+
+# =========================================================
+# MAIN
+# =========================================================
+
+echo
+echo "===== CHECKING ${USER_NAME} ====="
+
+IP=$(check_curl_ip)
+
+# =========================================================
+# CURL FAIL
+# =========================================================
+
+if ! is_ip "$IP"; then
+
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+
+    echo
+    echo "CURL FAIL"
+
+    log "curl fail count=${FAIL_COUNT}"
+
+    restart_redsocks
+
+    save_fail "$FAIL_COUNT"
+
+    trim_logs
+
+    exit 1
+fi
+
+# =========================================================
+# ARO OK
+# =========================================================
+
+if check_aro_status; then
+
+    echo
+    echo "ARO OK"
+
+    log "OK ip=${IP}"
+
+    reset_fail
+
+    trim_logs
+
+    exit 0
+fi
+
+# =========================================================
+# ARO FAIL
+# =========================================================
+
+FAIL_COUNT=$((FAIL_COUNT + 1))
+
+echo
+echo "ARO FAIL count=${FAIL_COUNT}"
+
+log "ARO FAIL count=${FAIL_COUNT}"
+
+save_fail "$FAIL_COUNT"
+
+# =========================================================
+# FAIL 1
+# =========================================================
+
+if [[ "$FAIL_COUNT" -eq 1 ]]; then
+
+    restart_redsocks
+
+    trim_logs
+
+    exit 1
+fi
+
+# =========================================================
+# FAIL 2
+# =========================================================
+
+if [[ "$FAIL_COUNT" -eq 2 ]]; then
+
+    restart_aro_gui
+
+    if check_aro_status; then
+
+        echo
+        echo "RECOVER GUI"
+
+        log "RECOVER GUI"
+
+        reset_fail
+
+        trim_logs
+
+        exit 0
+    fi
+fi
+
+# =========================================================
+# FAIL 3
+# =========================================================
+
+if [[ "$FAIL_COUNT" -eq 3 ]]; then
+
+    hard_restart_session
+
+    if check_aro_status; then
+
+        echo
+        echo "RECOVER HARD"
+
+        log "RECOVER HARD"
+
+        reset_fail
+
+        trim_logs
+
+        exit 0
+    fi
+fi
+
+# =========================================================
+# FAIL >=5
+# =========================================================
+
+if [[ "$FAIL_COUNT" -ge 5 ]]; then
+
+    echo
+    echo "SEND TELEGRAM ALERT"
+
+    send_tele "[ARO FAIL]
+USER=${USER_NAME}
+HOST=$(hostname)
+FAIL_COUNT=${FAIL_COUNT}"
+
+    log "telegram sent"
+fi
+
+trim_logs
+
+echo
+echo "DONE"
