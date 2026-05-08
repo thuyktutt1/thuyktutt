@@ -1,32 +1,5 @@
 #!/usr/bin/env bash
 
-# =========================================================
-# ARO WATCHDOG FULL
-#
-# Logic:
-#
-# 1. CHECK CURLIP
-#    FAIL -> restart redsocks
-#
-# 2. CURL OK
-#    CHECK AROIP + connect
-#
-# 3. ARO FAIL
-#    -> restart ARO GUI
-#
-# 4. FAIL nhiều lần
-#    -> terminate-user
-#    -> mở lại DISPLAY
-#
-# 5. FAIL quá nhiều
-#    -> Telegram alert
-#
-# Designed for:
-# - many aro users
-# - many VPS
-# - staggered timing
-# =========================================================
-
 set -u
 
 BASE_DIR="/opt/aro-watchdog"
@@ -52,6 +25,16 @@ is_ip() {
     [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
+trim_log() {
+
+    local FILE="$1"
+
+    [[ -f "$FILE" ]] || return
+
+    tail -n 1000 "$FILE" > /tmp/aro_trim.tmp
+    mv /tmp/aro_trim.tmp "$FILE"
+}
+
 get_display() {
 
     local USER="$1"
@@ -60,7 +43,13 @@ get_display() {
 
     DISP=$(ps -fu "$USER" | grep Xorg | grep -o ':[0-9]\+' | head -1)
 
-    [[ -z "$DISP" ]] && DISP=":10"
+    if [[ -z "$DISP" ]]; then
+
+        local UIDNUM
+        UIDNUM=$(id -u "$USER")
+
+        DISP=":$((UIDNUM - 1000 + 10))"
+    fi
 
     echo "$DISP"
 }
@@ -69,9 +58,7 @@ restart_aro() {
 
     local USER="$1"
 
-    echo "Restart ARO: $USER"
-
-    pkill -u "$USER" -f "/usr/bin/ARO" 2>/dev/null || true
+    pkill -u "$USER" -f '/usr/bin/ARO' 2>/dev/null || true
 
     sleep 5
 
@@ -87,11 +74,9 @@ hard_restart_user() {
 
     local USER="$1"
 
-    echo "Hard restart session: $USER"
+    loginctl terminate-user "$USER" || true
 
-    loginctl terminate-user "$USER"
-
-    sleep 15
+    sleep 20
 
     local DISP
     DISP=$(get_display "$USER")
@@ -105,11 +90,7 @@ restart_redsocks() {
 
     local USER="$1"
 
-    local SERVICE="redsocks-${USER}.service"
-
-    echo "Restart redsocks: $SERVICE"
-
-    systemctl restart "$SERVICE"
+    systemctl restart "redsocks-${USER}.service"
 
     sleep 20
 }
@@ -123,6 +104,9 @@ check_user() {
 
     local STATE_FILE
     STATE_FILE="$BASE_DIR/${USER}.state"
+
+    local LOG_FILE
+    LOG_FILE="$BASE_DIR/${USER}.log"
 
     local FAIL=0
 
@@ -139,6 +123,10 @@ check_user() {
 
     local CONN
     CONN=$(grep -o '"connect":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+
+    echo "$(date '+%F %T') curl=$CURLIP aroip=$AROIP connect=$CONN" >> "$LOG_FILE"
+
+    trim_log "$LOG_FILE"
 
     echo "CURLIP : $CURLIP"
     echo "AROIP  : $AROIP"
@@ -165,6 +153,8 @@ check_user() {
 
             echo "Still FAIL count=$FAIL"
 
+            echo "$(date '+%F %T') CURL FAIL count=$FAIL" >> "$LOG_FILE"
+
             if [[ "$FAIL" -ge 5 ]]; then
 
                 send_tele "$(hostname) $USER CURL FAIL x5"
@@ -186,6 +176,8 @@ check_user() {
 
         echo "0" > "$STATE_FILE"
 
+        echo "$(date '+%F %T') ARO OK" >> "$LOG_FILE"
+
         return
     fi
 
@@ -199,6 +191,8 @@ check_user() {
     echo "ARO FAIL count=$FAIL"
 
     echo "$FAIL" > "$STATE_FILE"
+
+    echo "$(date '+%F %T') ARO FAIL count=$FAIL" >> "$LOG_FILE"
 
     # FAIL 1-2
     if [[ "$FAIL" -lt 3 ]]; then
@@ -261,14 +255,15 @@ menu() {
         clear
 
         echo "====================================="
-        echo " ARO WATCHDOG FULL"
+        echo " ARO WATCHDOG FULL FINAL"
         echo "====================================="
         echo
         echo "1. Install watchdog user"
         echo "2. Check user now"
         echo "3. View fail count"
         echo "4. Reset fail count"
-        echo "5. Exit"
+        echo "5. View user logs"
+        echo "6. Exit"
         echo
 
         read -rp "Choose: " CH
@@ -322,14 +317,22 @@ menu() {
                 ;;
 
             5)
+
+                echo
+                read -rp "Nhap user: " USER
+
+                tail -n 50 "$BASE_DIR/${USER}.log" 2>/dev/null || true
+
+                read -rp "Enter..."
+                ;;
+
+            6)
                 exit
                 ;;
 
         esac
     done
 }
-
-# =========================================================
 
 if [[ "${1:-}" == "run" ]]; then
 
