@@ -1,384 +1,340 @@
 #!/usr/bin/env bash
+
+# =========================================================
+# ARO WATCHDOG FULL
+#
+# Logic:
+#
+# 1. CHECK CURLIP
+#    FAIL -> restart redsocks
+#
+# 2. CURL OK
+#    CHECK AROIP + connect
+#
+# 3. ARO FAIL
+#    -> restart ARO GUI
+#
+# 4. FAIL nhiều lần
+#    -> terminate-user
+#    -> mở lại DISPLAY
+#
+# 5. FAIL quá nhiều
+#    -> Telegram alert
+#
+# Designed for:
+# - many aro users
+# - many VPS
+# - staggered timing
+# =========================================================
+
 set -u
 
-# =========================================================
-# ARO WATCHDOG PRO
-#
-# FEATURES
-# - nhập user trực tiếp
-# - check curl IP
-# - check AROIP
-# - check connect=connected
-# - stagger delay
-# - fail counter
-# - restart redsocks
-# - restart ARO GUI
-# - terminate XFCE session
-# - Telegram alert
-#
-# RUN:
-#   bash aro-watchdog.sh
-#
-# =========================================================
-
-# =========================================================
-# CHỌN USER
-# =========================================================
-
-echo
-echo "===== USER AVAILABLE ====="
-getent passwd | awk -F: '$1 ~ /^aro[0-9]*$/ {print $1}' | sort -V
-echo
-
-read -rp "Nhap user (vd: aro8): " USER_NAME
-
-if [[ -z "$USER_NAME" ]]; then
-    echo "Chua nhap user"
-    exit 1
-fi
-
-id "$USER_NAME" >/dev/null 2>&1 || {
-    echo "User khong ton tai"
-    exit 1
-}
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-BASE_DIR="/etc/aro-watchdog"
-
+BASE_DIR="/opt/aro-watchdog"
 mkdir -p "$BASE_DIR"
 
-STATE_FILE="$BASE_DIR/${USER_NAME}.state"
-
-ARO_LOG="/home/${USER_NAME}/.local/share/com.aro.ARONetwork/logs/ARO Desktop.log"
-
-LOG_FILE="/var/log/aro-watchdog-${USER_NAME}.log"
-
-TELEGRAM_CONF="/etc/aro-proxy/telegram.conf"
-
-MAX_LOG_LINES=2000
-
-# =========================================================
-# STAGGER DELAY
-# =========================================================
-
-USER_NUM=$(echo "$USER_NAME" | grep -o '[0-9]*$')
-
-[[ -z "$USER_NUM" ]] && USER_NUM=0
-
-SLEEP_DELAY=$(( USER_NUM * 15 ))
-
-echo
-echo "Delay ${SLEEP_DELAY}s..."
-sleep "$SLEEP_DELAY"
-
-# =========================================================
-# LOG
-# =========================================================
-
-log() {
-    echo "$(date '+%F %T') $*" >> "$LOG_FILE"
-}
-
-trim_logs() {
-
-    if [[ -f "$LOG_FILE" ]]; then
-        tail -n "$MAX_LOG_LINES" "$LOG_FILE" > /tmp/aro-watchdog.tmp
-        mv /tmp/aro-watchdog.tmp "$LOG_FILE"
-    fi
-
-    if [[ -f "$ARO_LOG" ]]; then
-        tail -n 3000 "$ARO_LOG" > /tmp/aro-log.tmp
-        mv /tmp/aro-log.tmp "$ARO_LOG"
-    fi
-}
-
-# =========================================================
-# TELEGRAM
-# =========================================================
+TELEGRAM_TOKEN=""
+TELEGRAM_CHAT_ID=""
 
 send_tele() {
 
-    local msg="$1"
+    local MSG="$1"
 
-    [[ -f "$TELEGRAM_CONF" ]] || return
-
-    # shellcheck disable=SC1090
-    source "$TELEGRAM_CONF"
-
-    [[ -z "${BOT_TOKEN:-}" ]] && return
-    [[ -z "${CHAT_ID:-}" ]] && return
+    [[ -z "$TELEGRAM_TOKEN" ]] && return
+    [[ -z "$TELEGRAM_CHAT_ID" ]] && return
 
     curl -s -X POST \
-        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        -d chat_id="${CHAT_ID}" \
-        -d text="$msg" \
-        >/dev/null 2>&1 || true
-}
-
-# =========================================================
-# CHECK CURL IP
-# =========================================================
-
-check_curl_ip() {
-
-    su - "$USER_NAME" -c \
-        'curl -4 --max-time 20 -s https://api.ipify.org' \
-        2>/dev/null
+        "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+        -d chat_id="$TELEGRAM_CHAT_ID" \
+        -d text="$MSG" >/dev/null 2>&1
 }
 
 is_ip() {
     [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
-# =========================================================
-# CHECK ARO STATUS
-# =========================================================
+get_display() {
 
-check_aro_status() {
+    local USER="$1"
 
-    [[ -f "$ARO_LOG" ]] || return 1
+    local DISP
 
-    AROIP=$(grep -o '"publicIp":"[^"]*"' "$ARO_LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+    DISP=$(ps -fu "$USER" | grep Xorg | grep -o ':[0-9]\+' | head -1)
 
-    CONN=$(grep -o '"connect":"[^"]*"' "$ARO_LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+    [[ -z "$DISP" ]] && DISP=":10"
 
-    echo
-    echo "CURLIP : $IP"
-    echo "AROIP  : $AROIP"
-    echo "CONNECT: $CONN"
-
-    [[ -n "$AROIP" && "$CONN" == "connected" ]]
+    echo "$DISP"
 }
 
-# =========================================================
-# RESTART REDSOCKS
-# =========================================================
+restart_aro() {
 
-restart_redsocks() {
+    local USER="$1"
 
-    local svc="redsocks-${USER_NAME}.service"
+    echo "Restart ARO: $USER"
 
-    if systemctl list-unit-files | grep -q "^${svc}"; then
-
-        echo
-        echo "Restart redsocks..."
-
-        log "restart redsocks"
-
-        systemctl restart "$svc"
-
-        sleep 10
-    fi
-}
-
-# =========================================================
-# RESTART ARO GUI
-# =========================================================
-
-restart_aro_gui() {
-
-    echo
-    echo "Restart ARO GUI..."
-
-    log "restart aro gui"
-
-    pkill -u "$USER_NAME" -f '/usr/bin/ARO' 2>/dev/null || true
+    pkill -u "$USER" -f "/usr/bin/ARO" 2>/dev/null || true
 
     sleep 5
 
-    DISPLAY_NUM=$(w -h | awk -v u="$USER_NAME" '$1==u {print $3}' | head -1)
+    local DISP
+    DISP=$(get_display "$USER")
 
-    [[ -z "$DISPLAY_NUM" ]] && DISPLAY_NUM=":99"
+    su - "$USER" -c "export DISPLAY=$DISP && nohup /usr/bin/ARO >/dev/null 2>&1 &"
 
-    su - "$USER_NAME" -c \
-        "export DISPLAY=$DISPLAY_NUM && nohup /usr/bin/ARO >/dev/null 2>&1 &"
-
-    sleep 35
+    sleep 30
 }
 
-# =========================================================
-# HARD RESTART SESSION
-# =========================================================
+hard_restart_user() {
 
-hard_restart_session() {
+    local USER="$1"
 
-    echo
-    echo "Hard restart session..."
+    echo "Hard restart session: $USER"
 
-    log "hard restart session"
-
-    loginctl terminate-user "$USER_NAME"
+    loginctl terminate-user "$USER"
 
     sleep 15
 
-    DISPLAY_NUM=":99"
+    local DISP
+    DISP=$(get_display "$USER")
 
-    su - "$USER_NAME" -c \
-        "export DISPLAY=$DISPLAY_NUM && nohup /usr/bin/ARO >/dev/null 2>&1 &"
+    su - "$USER" -c "export DISPLAY=$DISP && nohup /usr/bin/ARO >/dev/null 2>&1 &"
 
-    sleep 45
+    sleep 40
 }
 
-# =========================================================
-# FAIL STATE
-# =========================================================
+restart_redsocks() {
 
-FAIL_COUNT=0
+    local USER="$1"
 
-if [[ -f "$STATE_FILE" ]]; then
-    FAIL_COUNT=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
-fi
+    local SERVICE="redsocks-${USER}.service"
 
-save_fail() {
-    echo "$1" > "$STATE_FILE"
+    echo "Restart redsocks: $SERVICE"
+
+    systemctl restart "$SERVICE"
+
+    sleep 20
 }
 
-reset_fail() {
-    rm -f "$STATE_FILE"
-}
+check_user() {
 
-# =========================================================
-# MAIN
-# =========================================================
+    local USER="$1"
 
-echo
-echo "===== CHECKING ${USER_NAME} ====="
+    local LOG
+    LOG="/home/$USER/.local/share/com.aro.ARONetwork/logs/ARO Desktop.log"
 
-IP=$(check_curl_ip)
+    local STATE_FILE
+    STATE_FILE="$BASE_DIR/${USER}.state"
 
-# =========================================================
-# CURL FAIL
-# =========================================================
+    local FAIL=0
 
-if ! is_ip "$IP"; then
-
-    FAIL_COUNT=$((FAIL_COUNT + 1))
+    [[ -f "$STATE_FILE" ]] && FAIL=$(cat "$STATE_FILE")
 
     echo
-    echo "CURL FAIL"
+    echo "===== CHECKING $USER ====="
 
-    log "curl fail count=${FAIL_COUNT}"
+    local CURLIP
+    CURLIP=$(su - "$USER" -c 'curl -4 --max-time 15 -s https://api.ipify.org' 2>/dev/null)
 
-    restart_redsocks
+    local AROIP
+    AROIP=$(grep -o '"publicIp":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
 
-    save_fail "$FAIL_COUNT"
+    local CONN
+    CONN=$(grep -o '"connect":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
 
-    trim_logs
+    echo "CURLIP : $CURLIP"
+    echo "AROIP  : $AROIP"
+    echo "CONNECT: $CONN"
 
-    exit 1
-fi
+    # =====================================================
+    # CURL FAIL
+    # =====================================================
 
-# =========================================================
-# ARO OK
-# =========================================================
-
-if check_aro_status; then
-
-    echo
-    echo "ARO OK"
-
-    log "OK ip=${IP}"
-
-    reset_fail
-
-    trim_logs
-
-    exit 0
-fi
-
-# =========================================================
-# ARO FAIL
-# =========================================================
-
-FAIL_COUNT=$((FAIL_COUNT + 1))
-
-echo
-echo "ARO FAIL count=${FAIL_COUNT}"
-
-log "ARO FAIL count=${FAIL_COUNT}"
-
-save_fail "$FAIL_COUNT"
-
-# =========================================================
-# FAIL 1
-# =========================================================
-
-if [[ "$FAIL_COUNT" -eq 1 ]]; then
-
-    restart_redsocks
-
-    trim_logs
-
-    exit 1
-fi
-
-# =========================================================
-# FAIL 2
-# =========================================================
-
-if [[ "$FAIL_COUNT" -eq 2 ]]; then
-
-    restart_aro_gui
-
-    if check_aro_status; then
+    if ! is_ip "$CURLIP"; then
 
         echo
-        echo "RECOVER GUI"
+        echo "CURL FAIL"
 
-        log "RECOVER GUI"
+        restart_redsocks "$USER"
 
-        reset_fail
+        CURLIP=$(su - "$USER" -c 'curl -4 --max-time 15 -s https://api.ipify.org' 2>/dev/null)
 
-        trim_logs
+        if ! is_ip "$CURLIP"; then
 
-        exit 0
+            FAIL=$((FAIL + 1))
+
+            echo "$FAIL" > "$STATE_FILE"
+
+            echo "Still FAIL count=$FAIL"
+
+            if [[ "$FAIL" -ge 5 ]]; then
+
+                send_tele "$(hostname) $USER CURL FAIL x5"
+
+            fi
+
+            return
+        fi
     fi
-fi
 
-# =========================================================
-# FAIL 3
-# =========================================================
+    # =====================================================
+    # ARO OK
+    # =====================================================
 
-if [[ "$FAIL_COUNT" -eq 3 ]]; then
-
-    hard_restart_session
-
-    if check_aro_status; then
+    if [[ -n "$AROIP" && "$CONN" == "connected" ]]; then
 
         echo
-        echo "RECOVER HARD"
+        echo "ARO OK"
 
-        log "RECOVER HARD"
+        echo "0" > "$STATE_FILE"
 
-        reset_fail
-
-        trim_logs
-
-        exit 0
+        return
     fi
-fi
 
-# =========================================================
-# FAIL >=5
-# =========================================================
+    # =====================================================
+    # ARO FAIL
+    # =====================================================
 
-if [[ "$FAIL_COUNT" -ge 5 ]]; then
+    FAIL=$((FAIL + 1))
 
     echo
-    echo "SEND TELEGRAM ALERT"
+    echo "ARO FAIL count=$FAIL"
 
-    send_tele "[ARO FAIL]
-USER=${USER_NAME}
-HOST=$(hostname)
-FAIL_COUNT=${FAIL_COUNT}"
+    echo "$FAIL" > "$STATE_FILE"
 
-    log "telegram sent"
+    # FAIL 1-2
+    if [[ "$FAIL" -lt 3 ]]; then
+
+        restart_aro "$USER"
+
+        return
+    fi
+
+    # FAIL 3-4
+    if [[ "$FAIL" -ge 3 && "$FAIL" -lt 5 ]]; then
+
+        hard_restart_user "$USER"
+
+        send_tele "$(hostname) $USER HARD RESTART"
+
+        return
+    fi
+
+    # FAIL >=5
+    if [[ "$FAIL" -ge 5 ]]; then
+
+        send_tele "$(hostname) $USER NEED MANUAL CHECK"
+
+    fi
+}
+
+install_cron() {
+
+    local USER="$1"
+
+    local DELAY
+    DELAY=$(( RANDOM % 180 ))
+
+    local SCRIPT
+    SCRIPT="$BASE_DIR/watchdog-$USER.sh"
+
+    cat > "$SCRIPT" <<EOF
+#!/usr/bin/env bash
+sleep $DELAY
+$(realpath "$0") run $USER
+EOF
+
+    chmod +x "$SCRIPT"
+
+    (
+        crontab -l 2>/dev/null | grep -v "watchdog-$USER.sh"
+        echo "*/10 * * * * $SCRIPT"
+    ) | crontab -
+
+    echo
+    echo "Installed cron for $USER"
+    echo "Delay: ${DELAY}s"
+}
+
+menu() {
+
+    while true; do
+
+        clear
+
+        echo "====================================="
+        echo " ARO WATCHDOG FULL"
+        echo "====================================="
+        echo
+        echo "1. Install watchdog user"
+        echo "2. Check user now"
+        echo "3. View fail count"
+        echo "4. Reset fail count"
+        echo "5. Exit"
+        echo
+
+        read -rp "Choose: " CH
+
+        case "$CH" in
+
+            1)
+
+                echo
+                echo "Users:"
+                getent passwd | awk -F: '$1 ~ /^aro[0-9]*$/ {print $1}' | sort -V
+
+                echo
+                read -rp "Nhap user: " USER
+
+                install_cron "$USER"
+
+                read -rp "Enter..."
+                ;;
+
+            2)
+
+                echo
+                read -rp "Nhap user: " USER
+
+                check_user "$USER"
+
+                read -rp "Enter..."
+                ;;
+
+            3)
+
+                echo
+                read -rp "Nhap user: " USER
+
+                cat "$BASE_DIR/${USER}.state" 2>/dev/null || echo 0
+
+                read -rp "Enter..."
+                ;;
+
+            4)
+
+                echo
+                read -rp "Nhap user: " USER
+
+                echo 0 > "$BASE_DIR/${USER}.state"
+
+                echo "RESET OK"
+
+                read -rp "Enter..."
+                ;;
+
+            5)
+                exit
+                ;;
+
+        esac
+    done
+}
+
+# =========================================================
+
+if [[ "${1:-}" == "run" ]]; then
+
+    check_user "$2"
+    exit
 fi
 
-trim_logs
-
-echo
-echo "DONE"
+menu
