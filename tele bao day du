@@ -1,67 +1,152 @@
 #!/usr/bin/env bash
 
-# =======================
-# CONFIG
-# =======================
-BOT_TOKEN="YOUR_BOT_TOKEN"
-CHAT_ID="YOUR_CHAT_ID"
+clear
 
-# VPS NAME (auto)
-VPS_NAME=$(hostname)
+echo "==============================="
+echo "        ARO TELE SETUP"
+echo "==============================="
 
-# TIME VN
-VN_TIME=$(TZ=Asia/Ho_Chi_Minh date '+%Y-%m-%d %H:%M:%S')
+read -p "Nhap BOT TOKEN: " BOT_TOKEN
+read -p "Nhap CHAT ID: " CHAT_ID
 
-# =======================
-# MESSAGE HEADER
-# =======================
-MSG="📡 ARO REPORT
-🖥 VPS: $VPS_NAME
-⏰ $VN_TIME (VN)
--------------------------
+echo
+echo "Dang test Telegram..."
+
+curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+-d chat_id="$CHAT_ID" \
+-d text="✅ Telegram connected VPS: $(hostname)" \
+>/dev/null
+
+echo "OK"
+sleep 1
+
+# ==========================
+# TAO FILE REPORT
+# ==========================
+
+cat > /root/aro-report.sh << EOF
+#!/usr/bin/env bash
+
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+
+VPS_NAME=\$(hostname)
+VN_TIME=\$(TZ=Asia/Ho_Chi_Minh date '+%Y-%m-%d %H:%M:%S')
+
+PUBLIC_IP=\$(curl -4 -s --max-time 10 https://api.ipify.org)
+
+RAM=\$(free -h | awk '/Mem:/ {print \$3 "/" \$2}')
+CPU=\$(uptime | awk -F'load average:' '{ print \$2 }' | cut -d',' -f1)
+DISK=\$(df -h / | awk 'NR==2 {print \$3 "/" \$2 " (" \$5 ")"}')
+
+MSG="🚀 ARO AUTO REPORT
+
+🖥 VPS : \$VPS_NAME
+🌍 VPS IP : \$PUBLIC_IP
+⏰ Time VN : \$VN_TIME
+
+💾 RAM : \$RAM
+🔥 CPU LOAD : \$CPU
+📦 DISK : \$DISK
+
+━━━━━━━━━━━━━━
+
 "
 
-# =======================
-# LOOP USERS
-# =======================
+TOTAL=0
+DOWN=0
+
 for home in /home/*; do
-  u=$(basename "$home")
 
-  LOG="$home/.local/share/com.aro.ARONetwork/logs/ARO Desktop.log"
+    [[ -d "\$home" ]] || continue
 
-  [[ -d "$home" ]] || continue
+    u=\$(basename "\$home")
 
-  CURLIP=$(sudo -u "$u" curl -4 --max-time 8 -s https://api.ipify.org 2>/dev/null)
+    LOG="\$home/.local/share/com.aro.ARONetwork/logs/ARO Desktop.log"
 
-  if [[ ! -f "$LOG" ]]; then
-    MSG+="$u | NO_LOG | curl=$CURLIP
+    TOTAL=\$((TOTAL+1))
+
+    if [[ ! -f "\$LOG" ]]; then
+
+        DOWN=\$((DOWN+1))
+
+        MSG+="👤 \$u
+🔴 NO LOG
+
 "
-    continue
-  fi
 
-  AROIP=$(grep -o '"publicIp":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
-  CONN=$(grep -o '"connect":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
-  UPTIME=$(grep -o '"uptime":[0-9.]*' "$LOG" 2>/dev/null | tail -1 | cut -d':' -f2)
+        continue
+    fi
 
-  AROIP=${AROIP:-"-"}
-  CONN=${CONN:-"-"}
-  UPTIME=${UPTIME:-0}
+    CONN=\$(grep -o '"connect":"[^"]*"' "\$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
 
-  STATUS="OK"
-  [[ "$CONN" != "connected" ]] && STATUS="DOWN"
+    AROIP=\$(grep -o '"publicIp":"[^"]*"' "\$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
 
-  MSG+="$u | $STATUS
-curl=$CURLIP | aroip=$AROIP | uptime=$UPTIME
+    UPTIME=\$(grep -o '"uptime":[0-9.]*' "\$LOG" 2>/dev/null | tail -1 | cut -d':' -f2)
+
+    AROIP=\${AROIP:-"-"}
+    UPTIME=\${UPTIME:-0}
+
+    STATUS="🟢 ONLINE"
+
+    if [[ "\$CONN" != "connected" ]]; then
+        STATUS="🔴 DOWN"
+        DOWN=\$((DOWN+1))
+    fi
+
+    MSG+="👤 \$u
+\$STATUS
+🌐 \$AROIP
+⏳ \$UPTIME
 
 "
 done
 
-# =======================
-# SEND TELEGRAM
-# =======================
-curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-  -d chat_id="$CHAT_ID" \
-  -d text="$MSG" \
-  -d disable_web_page_preview=true >/dev/null
+ONLINE=\$((TOTAL-DOWN))
 
+MSG+="━━━━━━━━━━━━━━
+
+📊 SUMMARY
+
+🟢 ONLINE : \$ONLINE
+🔴 DOWN : \$DOWN
+👥 TOTAL : \$TOTAL
+
+"
+
+curl -s -X POST "https://api.telegram.org/bot\$BOT_TOKEN/sendMessage" \
+-d chat_id="\$CHAT_ID" \
+-d text="\$MSG" \
+-d disable_web_page_preview=true \
+>/dev/null
+
+EOF
+
+chmod +x /root/aro-report.sh
+
+# ==========================
+# RANDOM 2 LAN / NGAY
+# ==========================
+
+crontab -r 2>/dev/null
+
+HOUR1=\$((RANDOM % 12))
+MIN1=\$((RANDOM % 60))
+
+HOUR2=\$((12 + RANDOM % 12))
+MIN2=\$((RANDOM % 60))
+
+(crontab -l 2>/dev/null; echo "\$MIN1 \$HOUR1 * * * /root/aro-report.sh") | crontab -
+(crontab -l 2>/dev/null; echo "\$MIN2 \$HOUR2 * * * /root/aro-report.sh") | crontab -
+
+echo
+echo "==============================="
 echo "DONE"
+echo "==============================="
+echo "Bao cao luc:"
+echo "➡ \$HOUR1:\$MIN1"
+echo "➡ \$HOUR2:\$MIN2"
+echo "==============================="
+echo
+
+bash /root/aro-report.sh
