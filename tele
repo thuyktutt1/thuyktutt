@@ -1,197 +1,156 @@
-cat > tele.sh <<'EOF'
-#!/usr/bin/env bash
-clear
-echo "==============================="
-echo " ARO TELE SETUP - DAILY RESET"
-echo "==============================="
+#!/bin/bash
 
-read -p "Nhap BOT TOKEN: " BOT_TOKEN
-read -p "Nhap CHAT ID: " CHAT_ID
+# ==================================================
+# ARO TELEGRAM DAILY CHECK INSTALLER
+# Chỉ check log + curl IP + gửi Telegram
+# KHÔNG restart service
+# KHÔNG sửa iptables
+# KHÔNG sửa redsocks
+# KHÔNG đụng proxy/watchdog cũ
+# ==================================================
 
-curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-  -d chat_id="$CHAT_ID" \
-  -d text="✅ Telegram connected VPS: $(hostname)" >/dev/null
+set -e
 
-cat > /root/aro-report.sh <<'REPORT'
-#!/usr/bin/env bash
+CHECK_SCRIPT="/root/aro-daily-check-telegram.sh"
+CONFIG_FILE="/root/aro-telegram-check.conf"
 
-BOT_TOKEN="REPLACE_BOT_TOKEN"
-CHAT_ID="REPLACE_CHAT_ID"
+echo "======================================"
+echo " ARO TELEGRAM DAILY CHECK INSTALLER"
+echo " Chỉ check, không ảnh hưởng hệ thống"
+echo "======================================"
+echo
 
-VPS_NAME=$(hostname)
-VN_DATE=$(TZ=Asia/Ho_Chi_Minh date '+%Y-%m-%d')
-VN_TIME=$(TZ=Asia/Ho_Chi_Minh date '+%Y-%m-%d %H:%M:%S')
-PUBLIC_IP=$(curl -4 -s --max-time 10 https://api.ipify.org)
+read -rp "Nhập BOT_TOKEN Telegram: " BOT_TOKEN
+read -rp "Nhập CHAT_ID Telegram: " CHAT_ID
 
-RAM=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
-CPU_LOAD=$(uptime | awk -F'load average:' '{print $2}' | cut -d',' -f1 | xargs)
-DISK=$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
-
-PREV_FILE="/root/aro-report-prev.tsv"
-DATE_FILE="/root/aro-report-date.txt"
-NOW_FILE="/root/aro-report-now.tsv"
-
-# Qua ngày mới thì xóa dữ liệu so sánh cũ
-OLD_DATE=$(cat "$DATE_FILE" 2>/dev/null)
-if [[ "$OLD_DATE" != "$VN_DATE" ]]; then
-  rm -f "$PREV_FILE"
-  echo "$VN_DATE" > "$DATE_FILE"
+if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+  echo "Lỗi: BOT_TOKEN hoặc CHAT_ID đang trống."
+  exit 1
 fi
 
-: > "$NOW_FILE"
+cat > "$CONFIG_FILE" <<EOF
+BOT_TOKEN="$BOT_TOKEN"
+CHAT_ID="$CHAT_ID"
+EOF
 
-TOTAL=0
-ONLINE=0
-DOWN=0
+chmod 600 "$CONFIG_FILE"
 
-MSG="📡 ARO REPORT
-━━━━━━━━━━━━━━━━━━━━
-🖥 VPS: $VPS_NAME
-🌐 VPS IP: $PUBLIC_IP
-⏰ Time VN: $VN_TIME
+cat > "$CHECK_SCRIPT" <<'EOF'
+#!/bin/bash
 
-💾 RAM: $RAM
-⚙️ CPU Load: $CPU_LOAD
-💽 Disk: $DISK
-━━━━━━━━━━━━━━━━━━━━
+# ==================================================
+# ARO DAILY TELEGRAM CHECK
+# Chỉ đọc log + curl IP + gửi Telegram
+# KHÔNG restart service
+# KHÔNG sửa iptables
+# KHÔNG sửa redsocks
+# KHÔNG đụng proxy
+# ==================================================
+
+CONFIG_FILE="/root/aro-telegram-check.conf"
+LOCKFILE="/tmp/aro-daily-check-telegram.lock"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "Thiếu config Telegram: $CONFIG_FILE"
+  exit 1
+fi
+
+source "$CONFIG_FILE"
+
+if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+  echo "Thiếu BOT_TOKEN hoặc CHAT_ID"
+  exit 1
+fi
+
+# Chống chạy trùng
+exec 9>"$LOCKFILE"
+flock -n 9 || exit 0
+
+DATE_NOW=$(date '+%Y-%m-%d %H:%M:%S')
+HOSTNAME_NOW=$(hostname)
+
+MSG="📊 ARO DAILY CHECK
+VPS: $HOSTNAME_NOW
+Time: $DATE_NOW
+
 "
-
-DETAILS=""
-CHANGES=""
 
 for home in /home/*; do
   [[ -d "$home" ]] || continue
+
   u=$(basename "$home")
 
-  [[ "$u" =~ ^aro[0-9]*$ ]] || continue
+  # Chỉ check user tồn tại thật
+  id "$u" >/dev/null 2>&1 || continue
 
-  TOTAL=$((TOTAL+1))
   LOG="$home/.local/share/com.aro.ARONetwork/logs/ARO Desktop.log"
 
-  CURLIP=$(su - "$u" -c "curl -4 -s --max-time 8 https://api.ipify.org" 2>/dev/null)
-  CURLIP=${CURLIP:-"-"}
+  # Chỉ curl IP theo user, không sửa gì
+  CURLIP=$(timeout 12 sudo -u "$u" curl -4 --max-time 10 -s https://api.ipify.org 2>/dev/null || true)
+  CURLIP=${CURLIP:-NO_CURL}
 
   if [[ ! -f "$LOG" ]]; then
-    STATUS="❌ NOLOG"
-    CONN="no_log"
-    AROIP="-"
-    UPTIME="0"
-    TODAY="0"
-    DOWN=$((DOWN+1))
-  else
-    CONN=$(grep -o '"connect":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
-    AROIP=$(grep -o '"publicIp":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
-    UPTIME=$(grep -o '"uptime":[0-9.]*' "$LOG" 2>/dev/null | tail -1 | cut -d':' -f2)
-    TODAY=$(grep -o '"today":[0-9.]*' "$LOG" 2>/dev/null | tail -1 | cut -d':' -f2)
-
-    CONN=${CONN:-"-"}
-    AROIP=${AROIP:-"-"}
-    UPTIME=${UPTIME:-0}
-    TODAY=${TODAY:-0}
-
-    if [[ "$CONN" == "connected" ]]; then
-      STATUS="✅ ON"
-      ONLINE=$((ONLINE+1))
-    else
-      STATUS="❌ DOWN"
-      DOWN=$((DOWN+1))
-    fi
+    MSG+="$u | curl=$CURLIP | AROIP=NO_LOG | connect=NO_LOG | uptime=0 | today=0
+"
+    continue
   fi
 
-  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$u" "$CURLIP" "$AROIP" "$CONN" "$UPTIME" "$TODAY" >> "$NOW_FILE"
+  AROIP=$(grep -o '"publicIp":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+  CONN=$(grep -o '"connect":"[^"]*"' "$LOG" 2>/dev/null | tail -1 | cut -d'"' -f4)
+  UPTIME=$(grep -o '"uptime":[0-9.]*' "$LOG" 2>/dev/null | tail -1 | cut -d':' -f2)
+  TODAY=$(grep -o '"today":[0-9.]*' "$LOG" 2>/dev/null | tail -1 | cut -d':' -f2)
 
-  DETAILS+="👤 $u | $STATUS
-curl: $CURLIP
-ARO : $AROIP
-connect: $CONN
-uptime: $UPTIME
-today: $TODAY
+  AROIP=${AROIP:-"-"}
+  CONN=${CONN:-"-"}
+  UPTIME=${UPTIME:-0}
+  TODAY=${TODAY:-0}
 
+  MSG+="$u | curl=$CURLIP | AROIP=$AROIP | connect=$CONN | uptime=$UPTIME | today=$TODAY
 "
-
-  if [[ -f "$PREV_FILE" ]]; then
-    OLD_LINE=$(awk -F'\t' -v user="$u" '$1==user {print}' "$PREV_FILE" | tail -1)
-
-    if [[ -n "$OLD_LINE" ]]; then
-      OLD_CURL=$(echo "$OLD_LINE" | awk -F'\t' '{print $2}')
-      OLD_AROIP=$(echo "$OLD_LINE" | awk -F'\t' '{print $3}')
-      OLD_CONN=$(echo "$OLD_LINE" | awk -F'\t' '{print $4}')
-      OLD_UPTIME=$(echo "$OLD_LINE" | awk -F'\t' '{print $5}')
-      OLD_TODAY=$(echo "$OLD_LINE" | awk -F'\t' '{print $6}')
-
-      DIFF_UP=$(awk -v a="$UPTIME" -v b="$OLD_UPTIME" 'BEGIN {printf "%.6f", a-b}')
-      DIFF_TODAY=$(awk -v a="$TODAY" -v b="$OLD_TODAY" 'BEGIN {printf "%.6f", a-b}')
-
-      CHANGES+="👤 $u
-uptime: $OLD_UPTIME → $UPTIME | +$DIFF_UP
-today : $OLD_TODAY → $TODAY | +$DIFF_TODAY
-"
-
-      [[ "$CURLIP" != "$OLD_CURL" ]] && CHANGES+="curl IP đổi: $OLD_CURL → $CURLIP
-"
-      [[ "$AROIP" != "$OLD_AROIP" ]] && CHANGES+="ARO IP đổi: $OLD_AROIP → $AROIP
-"
-      [[ "$CONN" != "$OLD_CONN" ]] && CHANGES+="connect đổi: $OLD_CONN → $CONN
-"
-
-      CHANGES+="
-"
-    fi
-  fi
 done
 
-MSG+="📊 SUMMARY
-✅ ONLINE: $ONLINE
-❌ DOWN: $DOWN
-👥 TOTAL: $TOTAL
-
-━━━━━━━━━━━━━━━━━━━━
-📋 NODE STATUS
-$DETAILS"
-
-if [[ -f "$PREV_FILE" ]]; then
-  MSG+="━━━━━━━━━━━━━━━━━━━━
-🔁 SO SÁNH TRONG NGÀY
-$CHANGES"
-else
-  MSG+="━━━━━━━━━━━━━━━━━━━━
-ℹ️ Lần report đầu trong ngày, chưa so sánh."
+# Nếu tin nhắn quá dài, cắt bớt để Telegram không lỗi
+MAX_LEN=3900
+if [[ ${#MSG} -gt $MAX_LEN ]]; then
+  MSG="${MSG:0:$MAX_LEN}
+...
+Tin nhắn quá dài, đã cắt bớt."
 fi
-
-cp "$NOW_FILE" "$PREV_FILE"
 
 curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
   -d chat_id="$CHAT_ID" \
-  -d text="$MSG" \
-  -d disable_web_page_preview=true >/dev/null
-REPORT
+  --data-urlencode text="$MSG" >/dev/null 2>&1
 
-sed -i "s|REPLACE_BOT_TOKEN|$BOT_TOKEN|g" /root/aro-report.sh
-sed -i "s|REPLACE_CHAT_ID|$CHAT_ID|g" /root/aro-report.sh
-chmod +x /root/aro-report.sh
-
-# Không xóa cron cũ. Chỉ xóa dòng report cũ nếu có.
-crontab -l 2>/dev/null | grep -v "/root/aro-report.sh" > /tmp/cron_keep || true
-
-# Random 2 lần/ngày
-HOUR1=$((RANDOM % 12))
-MIN1=$((RANDOM % 60))
-HOUR2=$((12 + RANDOM % 12))
-MIN2=$((RANDOM % 60))
-
-echo "$MIN1 $HOUR1 * * * /root/aro-report.sh >/dev/null 2>&1" >> /tmp/cron_keep
-echo "$MIN2 $HOUR2 * * * /root/aro-report.sh >/dev/null 2>&1" >> /tmp/cron_keep
-
-crontab /tmp/cron_keep
-rm -f /tmp/cron_keep
-
-echo "DONE"
-echo "Report moi ngay:"
-echo "Lan 1: $HOUR1:$MIN1"
-echo "Lan 2: $HOUR2:$MIN2"
-
-bash /root/aro-report.sh
+exit 0
 EOF
 
-chmod +x tele.sh
-./tele.sh
+chmod +x "$CHECK_SCRIPT"
+
+# Xóa cron cũ của chính script này, không đụng cron redsocks/watchdog
+TMP_CRON="/tmp/aro_telegram_cron.tmp"
+crontab -l 2>/dev/null | grep -v 'ARO_DAILY_RANDOM_TELEGRAM' > "$TMP_CRON" || true
+
+# Random lần 1: 08:00 - 14:00
+echo '0 8 * * * sleep $((RANDOM % 21600)) && /root/aro-daily-check-telegram.sh >/dev/null 2>&1 # ARO_DAILY_RANDOM_TELEGRAM_MORNING' >> "$TMP_CRON"
+
+# Random lần 2: 18:00 - 23:00
+echo '0 18 * * * sleep $((RANDOM % 18000)) && /root/aro-daily-check-telegram.sh >/dev/null 2>&1 # ARO_DAILY_RANDOM_TELEGRAM_EVENING' >> "$TMP_CRON"
+
+crontab "$TMP_CRON"
+rm -f "$TMP_CRON"
+
+echo
+echo "Đã cài xong."
+echo
+echo "File check:"
+echo "$CHECK_SCRIPT"
+echo
+echo "File config:"
+echo "$CONFIG_FILE"
+echo
+echo "Cron hiện tại:"
+crontab -l | grep 'ARO_DAILY_RANDOM_TELEGRAM' || true
+echo
+echo "Đang gửi test Telegram..."
+bash "$CHECK_SCRIPT"
+echo "Xong. Nếu Telegram nhận tin là OK."
